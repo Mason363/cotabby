@@ -552,6 +552,20 @@ struct ActiveSuggestionSession: Equatable, Sendable {
         )
     }
 
+    /// Rewrites the session as if the suggestion had always carried a single space at the current
+    /// seam, immediately typed through. Used when the user taps space where the tail continues a
+    /// word directly: the space joins `acceptedText` (so consumed-prefix reconciliation matches the
+    /// live editor, which really does contain it) and `remainingText` is untouched.
+    func absorbingTypedSeamWhitespace() -> ActiveSuggestionSession {
+        ActiveSuggestionSession(
+            baseContext: baseContext,
+            fullText: acceptedText + " " + remainingText,
+            consumedCharacterCount: consumedCharacterCount + 1,
+            latency: latency,
+            kind: kind
+        )
+    }
+
     /// Rebuilds the session from a fully observed live editor state during reconciliation.
     /// This is useful when AX catches up after optimistic UI updates such as partial Tab accepts.
     func withConsumedCharacters(_ consumedCharacters: Int) -> ActiveSuggestionSession {

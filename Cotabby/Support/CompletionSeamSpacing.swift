@@ -47,6 +47,23 @@ nonisolated enum CompletionSeamSpacing {
             }
         }
 
+        // Sentence/clause punctuation → word seam: the model's intent is measurably unreliable here
+        // (241 glued sentence starts like "fast."+"I am" in one day's llm-io stream), so force the
+        // single space — except for the two joins where gluing is the correct reading:
+        //   • digit.digit / digit,digit / digit:digit — decimals, thousands separators, times;
+        //   • "." + a bare TLD/file-extension token — "spaceship." + "com", "v80." + "html".
+        if isSeamPunctuation(lastChar), let firstBody = body.first, isWordCharacter(firstBody) {
+            let beforePunctuation = precedingText.dropLast().last
+            if let beforePunctuation, beforePunctuation.isNumber, firstBody.isNumber {
+                return (modelWantedSpace ? " " : "") + body
+            }
+            if lastChar == ".", !modelWantedSpace,
+               Self.glueAfterPeriod.contains(leadingWord(of: body).lowercased()) {
+                return body
+            }
+            return " " + body
+        }
+
         // Only a word-character ↔ word-character seam is ambiguous. If the completion opens with
         // punctuation, or the preceding text ends in punctuation, the model's intent is the right call.
         guard isWordCharacter(lastChar),
@@ -75,6 +92,21 @@ nonisolated enum CompletionSeamSpacing {
     private static func isWordCharacter(_ character: Character) -> Bool {
         character.isLetter || character.isNumber
     }
+
+    /// Punctuation that ends a sentence or clause, after which a word almost always wants a space.
+    private static func isSeamPunctuation(_ character: Character) -> Bool {
+        ".!?,;:".contains(character)
+    }
+
+    /// Tokens that legitimately glue directly onto a trailing period: domain TLDs and common file
+    /// extensions. Matched against the completion's whole leading word, so "communication" never
+    /// matches "com".
+    private static let glueAfterPeriod: Set<String> = [
+        "com", "net", "org", "io", "ai", "co", "dev", "app", "edu", "gov",
+        "html", "htm", "js", "css", "json", "md", "txt", "png", "jpg", "jpeg", "gif", "svg",
+        "pdf", "csv", "yml", "yaml", "xml", "swift", "py", "ts", "tsx", "zip", "mp4", "mov",
+        "wav", "mp3"
+    ]
 
     private static func trailingWord(of text: String) -> String {
         String(text.reversed().prefix(while: { isWordCharacter($0) }).reversed())

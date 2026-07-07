@@ -70,6 +70,52 @@ final class CompletionSeamSpacingTests: XCTestCase {
         XCTAssertEqual(result, " world")
     }
 
+    func test_forcesSpaceWhenModelGluesASentenceStartOntoPunctuation() {
+        // "fast." + "I am": models measurably omit the space after sentence punctuation; force it.
+        for punctuation in [".", "!", "?", ",", ";", ":"] {
+            let result = CompletionSeamSpacing.normalized(
+                completion: "I am not sure",
+                precedingText: "amazingly fast" + punctuation,
+                isKnownWord: known([])
+            )
+            XCTAssertEqual(result, " I am not sure", "after \"\(punctuation)\"")
+        }
+    }
+
+    func test_keepsDigitJoinsGluedAcrossPunctuation() {
+        // Decimals, times, and thousands separators: "3." + "14" must stay glued.
+        XCTAssertEqual(
+            CompletionSeamSpacing.normalized(completion: "14159", precedingText: "pi is 3.", isKnownWord: known([])),
+            "14159"
+        )
+        XCTAssertEqual(
+            CompletionSeamSpacing.normalized(completion: "000 dollars", precedingText: "about 1,", isKnownWord: known([])),
+            "000 dollars"
+        )
+        XCTAssertEqual(
+            CompletionSeamSpacing.normalized(completion: "30 pm", precedingText: "at 4:", isKnownWord: known([])),
+            "30 pm"
+        )
+    }
+
+    func test_keepsDomainAndFileExtensionGluedAfterPeriod() {
+        // "spaceship." + "com" and "v80." + "html" are joins, not sentence starts.
+        XCTAssertEqual(
+            CompletionSeamSpacing.normalized(completion: "com/page", precedingText: "visit spaceship.", isKnownWord: known([])),
+            "com/page"
+        )
+        XCTAssertEqual(
+            CompletionSeamSpacing.normalized(completion: "html", precedingText: "open v80.", isKnownWord: known([])),
+            "html"
+        )
+        // A word that merely STARTS with a TLD is a sentence start, not a join.
+        XCTAssertEqual(
+            CompletionSeamSpacing.normalized(
+                completion: "communication is key", precedingText: "it ended.", isKnownWord: known([])),
+            " communication is key"
+        )
+    }
+
     func test_stripsMidWordHyphenArtifact() {
         // "sup" + "-posed": dropping the hyphen yields the real word "supposed", so the hyphen is a
         // decode artifact and must go.

@@ -381,6 +381,31 @@ extension SuggestionCoordinator {
         Int((DispatchTime.now().uptimeNanoseconds &- uptimeNanoseconds) / 1_000_000)
     }
 
+    /// Records WHY a keystroke failed to advance the visible suggestion (classes only — never the
+    /// typed content). "Typing through the ghost kills it" reports are only diagnosable from this
+    /// breakdown: a `space -> word` mismatch is a seam bug, `word -> word` is a genuine divergence.
+    private func logTypedMismatch(typedCharacters: String, session: ActiveSuggestionSession) {
+        guard CotabbyDebugOptions.minimumLogLevel <= .debug else { return }
+        func charClass(_ character: Character?) -> String {
+            guard let character else { return "empty" }
+            if character == " " { return "space" }
+            if character.isWhitespace { return "whitespace" }
+            if character.isLetter || character.isNumber { return "word" }
+            return "punct"
+        }
+        CotabbyLogger.suggestion.debug(
+            "Typed input did not match the active suggestion tail.",
+            metadata: [
+                "stage": .string("typed-mismatch"),
+                "typed_len": .stringConvertible(typedCharacters.count),
+                "typed_class": .string(charClass(typedCharacters.first)),
+                "tail_head_class": .string(charClass(session.remainingText.first)),
+                "is_correction": .stringConvertible(session.kind.isCorrection),
+                "tail_len": .stringConvertible(session.remainingText.count)
+            ]
+        )
+    }
+
     func handleSuppressedSyntheticInput() {
         logStage(
             "suppressed-synthetic-input",
@@ -400,6 +425,7 @@ extension SuggestionCoordinator {
                 return false
             }
 
+            logTypedMismatch(typedCharacters: event.characters, session: session)
             invalidateActiveSuggestion(
                 reason: SuggestionSessionReconciler.overlayHideReason(for: event),
                 clearDiagnostics: false

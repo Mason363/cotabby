@@ -38,11 +38,30 @@ enum SuggestionSessionReconciler {
             return nil
         }
 
-        guard session.remainingText.hasPrefix(typedCharacters) else {
-            return nil
+        if session.remainingText.hasPrefix(typedCharacters) {
+            return session.advancing(by: typedCharacters.count)
         }
 
-        return session.advancing(by: typedCharacters.count)
+        // Absorb a single typed space at a word seam instead of invalidating. When the tail
+        // continues directly with a word ("hello" + ghost "world") and the user taps space, the
+        // strict prefix match above fails and the whole suggestion used to be torn down and
+        // regenerated — the "typing a space changes the ghost" report. The user's space does not
+        // contradict the suggestion's content; it only commits the word boundary. Modeling it as
+        // if the suggestion had always carried that space (typed through it) keeps every
+        // downstream consumed-prefix comparison consistent with the live editor text.
+        // Correction sessions are excluded: their accept replaces the typo word wholesale, so a
+        // typed space genuinely diverges. So is a seam that already sits after whitespace — a
+        // second space is a real content change the suggestion does not contain.
+        if typedCharacters == " ",
+           !session.kind.isCorrection,
+           let firstRemaining = session.remainingText.first,
+           firstRemaining.isLetter || firstRemaining.isNumber,
+           let lastPreceding = (session.baseContext.precedingText + session.acceptedText).last,
+           !lastPreceding.isWhitespace {
+            return session.absorbingTypedSeamWhitespace()
+        }
+
+        return nil
     }
 
     /// Reconciles the active suggestion session with live AX editor state while preserving the

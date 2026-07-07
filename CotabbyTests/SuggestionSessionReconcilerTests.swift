@@ -49,6 +49,52 @@ final class SuggestionSessionReconcilerTests: XCTestCase {
         XCTAssertNil(SuggestionSessionReconciler.advanceIfTypedCharactersMatch("", session: session))
     }
 
+    func test_advanceIfTypedCharactersMatch_absorbsTypedSpaceAtWordSeam() {
+        // Tail continues the word directly ("Hello" + ghost "world…"); a typed space commits the
+        // boundary without contradicting the content — the session must survive with the space in
+        // its consumed prefix and the tail untouched, not be invalidated and regenerated.
+        let session = CotabbyTestFixtures.activeSession(fullText: "world again", basePrecedingText: "Hello")
+
+        let advanced = SuggestionSessionReconciler.advanceIfTypedCharactersMatch(" ", session: session)
+
+        XCTAssertEqual(advanced?.acceptedText, " ")
+        XCTAssertEqual(advanced?.remainingText, "world again")
+        XCTAssertEqual(advanced?.fullText, " world again")
+    }
+
+    func test_advanceIfTypedCharactersMatch_spacePrefixMatchOutranksAbsorb() {
+        let session = CotabbyTestFixtures.activeSession(
+            fullText: " world again",
+            consumedCharacterCount: 6,
+            basePrecedingText: "Hello"
+        )
+        XCTAssertEqual(session.remainingText, " again")
+
+        // Tail starts with a space, so a typed space is a plain prefix match, not an absorb.
+        let spaceAdvanced = SuggestionSessionReconciler.advanceIfTypedCharactersMatch(" ", session: session)
+        XCTAssertEqual(spaceAdvanced?.remainingText, "again")
+
+        // One more typed space now sits after whitespace — a real content change; invalidate.
+        if let spaceAdvanced {
+            XCTAssertNil(SuggestionSessionReconciler.advanceIfTypedCharactersMatch(" ", session: spaceAdvanced))
+        }
+    }
+
+    func test_advanceIfTypedCharactersMatch_doesNotAbsorbSpaceAfterExistingWhitespace() {
+        // The effective preceding text already ends in a space: a second typed space is real
+        // content the suggestion does not contain.
+        let session = CotabbyTestFixtures.activeSession(fullText: "world", basePrecedingText: "Hello ")
+
+        XCTAssertNil(SuggestionSessionReconciler.advanceIfTypedCharactersMatch(" ", session: session))
+    }
+
+    func test_advanceIfTypedCharactersMatch_doesNotAbsorbSpaceBeforePunctuationTail() {
+        // Tail starts with punctuation (". I'm…"): a typed space genuinely diverges.
+        let session = CotabbyTestFixtures.activeSession(fullText: ". I'm not sure", basePrecedingText: "VOO")
+
+        XCTAssertNil(SuggestionSessionReconciler.advanceIfTypedCharactersMatch(" ", session: session))
+    }
+
     func test_nextAcceptanceChunk_includesLeadingWhitespaceAndNextVisibleToken() {
         XCTAssertEqual(
             SuggestionSessionReconciler.nextAcceptanceChunk(from: "  world again"),
