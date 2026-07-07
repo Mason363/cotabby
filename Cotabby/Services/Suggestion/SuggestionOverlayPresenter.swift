@@ -23,10 +23,13 @@ struct SuggestionOverlayPresenter {
     /// to skip the AppKit call: the controller picks the mode internally each time and re-applying
     /// the same text/geometry is cheap. The diagnostic messages below do distinguish a mode flip so
     /// operators see when inline → mirror (or back) actually happened.
+    /// `presentation` carries telemetry-only identifiers (request/work ids, host bundle) through
+    /// to the controller; it never participates in the change-detection below.
     func present(
         text: String,
         geometry: SuggestionOverlayGeometry,
-        previousState: OverlayState
+        previousState: OverlayState,
+        presentation: OverlayPresentationContext? = nil
     ) -> String? {
         let displayText = text.trimmingCharacters(in: .whitespaces).isEmpty ? "" : text
         guard !displayText.isEmpty else {
@@ -43,7 +46,7 @@ struct SuggestionOverlayPresenter {
             return nil
         }
 
-        overlayController.showSuggestion(displayText, geometry: geometry)
+        overlayController.showSuggestion(displayText, geometry: geometry, presentation: presentation)
 
         switch previousState {
         case .visible(let previousText, let previousGeometry, let previousMode)

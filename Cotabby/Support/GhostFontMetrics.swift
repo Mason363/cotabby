@@ -58,6 +58,13 @@ enum GhostFontMetrics {
         return max(absoluteMinimumPointSize, autoSize * sizeMultiplier)
     }
 
+    /// Whether the caret-height derivation would use the field font's glyph-box ratio (as opposed
+    /// to the fixed fallback ratio). Exposed so placement telemetry records the sizing path the
+    /// derivation genuinely took instead of re-guessing it from the inputs.
+    static func usesMetricRatio(_ metrics: FieldFontMetrics?) -> Bool {
+        metricRatio(metrics) != nil
+    }
+
     /// `pointSize / (ascender - descender)` for the field font, or nil when the metrics are unusable.
     private static func metricRatio(_ metrics: FieldFontMetrics?) -> CGFloat? {
         guard let metrics, metrics.pointSize > 0 else {

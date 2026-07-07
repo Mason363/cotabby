@@ -789,7 +789,13 @@ extension SuggestionCoordinator {
         if let message = overlayPresenter.present(
             text: text,
             geometry: geometry,
-            previousState: overlayState
+            previousState: overlayState,
+            presentation: OverlayPresentationContext(
+                requestID: latestRequestID,
+                workID: currentWorkID,
+                hostBundleID: context.bundleIdentifier,
+                caretSource: context.caretSource
+            )
         ) {
             latestOverlayMessage = message
         }

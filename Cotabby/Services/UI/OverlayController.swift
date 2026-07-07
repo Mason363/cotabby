@@ -77,6 +77,11 @@ final class OverlayController: SuggestionOverlayControlling {
     private var lastInlineRenderFont: NSFont?
     private var lastInlineFontSize: CGFloat?
 
+    /// The most recent presentation context handed in with a show, kept so telemetry from paths
+    /// that never receive one directly (`advanceInline`, the hysteresis hold, `hide`) can still
+    /// attribute their records to the request that put the ghost on screen.
+    private var lastPresentationContext: OverlayPresentationContext?
+
     init(
         suggestionSettings: SuggestionSettingsModel,
         renderModePolicyOverride: CompletionRenderModePolicy? = nil
@@ -134,6 +139,17 @@ final class OverlayController: SuggestionOverlayControlling {
     /// Each mode is responsible for its own layout math and SwiftUI view; this entry point just
     /// routes and records the resulting state.
     func showSuggestion(_ text: String, geometry: SuggestionOverlayGeometry) {
+        showSuggestion(text, geometry: geometry, presentation: nil)
+    }
+
+    func showSuggestion(
+        _ text: String,
+        geometry: SuggestionOverlayGeometry,
+        presentation: OverlayPresentationContext?
+    ) {
+        if let presentation {
+            lastPresentationContext = presentation
+        }
         guard !text.isEmpty else {
             hide(reason: "Overlay not shown because the suggestion was empty.")
             return
@@ -152,10 +168,23 @@ final class OverlayController: SuggestionOverlayControlling {
         let mode: CompletionRenderMode
         switch resolvePresentation(policyMode: policyMode, geometry: geometry, text: text) {
         case .holdInline:
+            logPlacement(
+                event: .holdInline,
+                geometry: geometry,
+                text: text,
+                renderMode: "inline",
+                hysteresis: .held,
+                panelFrame: panel.frame
+            )
             return
         case .render(let resolved):
             mode = resolved
         }
+
+        // The hysteresis only ever overrides the policy toward `.inline`; recording the divergence
+        // makes "policy wanted the card but we stayed inline" countable in the telemetry stream.
+        let hysteresis: GhostPlacementTelemetry.Hysteresis =
+            mode == policyMode ? .none : .rerenderedInline
 
         // Decide on the fade using the panel state captured *before* `state` is reassigned below, so
         // the animation plays only on a genuine appearance. A reposition and a streamed-token
@@ -181,9 +210,9 @@ final class OverlayController: SuggestionOverlayControlling {
 
         switch mode {
         case .inline:
-            showInline(text: text, geometry: geometry)
+            showInline(text: text, geometry: geometry, hysteresis: hysteresis)
         case .mirror(let reason):
-            showMirror(text: text, geometry: geometry, reason: reason)
+            showMirror(text: text, geometry: geometry, reason: reason, hysteresis: hysteresis)
         }
 
         state = .visible(text: text, geometry: geometry, mode: mode)
@@ -240,6 +269,17 @@ final class OverlayController: SuggestionOverlayControlling {
 
     /// Hides the floating panel and records why the overlay is no longer visible.
     func hide(reason: String) {
+        // Log only the visible→hidden edge (hide is also called redundantly while already hidden),
+        // with the last visible text/geometry so the record closes out the presentation it ends.
+        if case let .visible(text, geometry, _) = state {
+            logPlacement(
+                event: .hide,
+                geometry: geometry,
+                text: text,
+                panelFrame: panel.frame,
+                hideReason: reason
+            )
+        }
         panel.orderOut(nil)
         strikePanel.orderOut(nil)
         state = .hidden(reason: reason)
@@ -274,7 +314,10 @@ final class OverlayController: SuggestionOverlayControlling {
     private func showInline(
         text: String,
         geometry: SuggestionOverlayGeometry,
-        precomputedLayout: GhostSuggestionLayout? = nil
+        precomputedLayout: GhostSuggestionLayout? = nil,
+        hysteresis: GhostPlacementTelemetry.Hysteresis = .none,
+        telemetryEvent: GhostPlacementTelemetry.Event = .inlineShow,
+        advanceShift: CGFloat? = nil
     ) {
         // Key the stabilizer on the field's identity rather than `focusChangeSequence`. The polling
         // signature in `FocusTracker` bumps `focusChangeSequence` whenever the field's frame
@@ -288,7 +331,7 @@ final class OverlayController: SuggestionOverlayControlling {
         // The host field's own font, when AX exposed it. Instantiated at the reported size only to
         // read its (scale-invariant) glyph-box ratio; the rendered size comes from the caret height.
         let referenceFieldFont = geometry.resolvedFieldStyle.flatMap(fieldFont(from:))
-        let fontSize = resolvedGhostFontSize(
+        let (fontSize, fontPath) = resolvedGhostFontSize(
             forCaretHeight: stabilizedCaretHeight,
             caretQuality: geometry.caretQuality,
             fieldFont: referenceFieldFont,
@@ -356,6 +399,25 @@ final class OverlayController: SuggestionOverlayControlling {
         }
         panel.setFrame(frame.integral, display: true)
         panel.orderFrontRegardless()
+
+        // Log the integral frame — the one actually applied — so the record never carries the
+        // sub-pixel lie of the raw computed frame.
+        logPlacement(
+            event: telemetryEvent,
+            geometry: geometry,
+            text: text,
+            renderMode: "inline",
+            hysteresis: hysteresis,
+            fontPath: fontPath,
+            fontName: renderFont?.fontName,
+            fontSize: fontSize,
+            glyphBoxHeight: layout.glyphBoxHeight,
+            lineHeight: layout.lineHeight,
+            panelFrame: frame.integral,
+            contentHeight: contentSize.height,
+            lineCount: layout.lines.count,
+            advanceShift: advanceShift
+        )
 
         // Capture exactly what this inline render used, so a subsequent `advanceInline` slides the
         // panel by the prefix width measured in the same typeface and size.
@@ -478,7 +540,13 @@ final class OverlayController: SuggestionOverlayControlling {
         // directly. The overlay is inline (guarded above) and the caret only shifted horizontally, so
         // the render mode cannot change; setting `.inline` keeps `OverlayState` coherent for the accept
         // and stability gates.
-        showInline(text: remainingText, geometry: advancedGeometry, precomputedLayout: afterLayout)
+        showInline(
+            text: remainingText,
+            geometry: advancedGeometry,
+            precomputedLayout: afterLayout,
+            telemetryEvent: .advanceInline,
+            advanceShift: shift
+        )
         state = .visible(text: remainingText, geometry: advancedGeometry, mode: .inline)
         return true
     }
@@ -490,7 +558,8 @@ final class OverlayController: SuggestionOverlayControlling {
     private func showMirror(
         text: String,
         geometry: SuggestionOverlayGeometry,
-        reason: CompletionRenderMode.MirrorReason
+        reason: CompletionRenderMode.MirrorReason,
+        hysteresis: GhostPlacementTelemetry.Hysteresis = .none
     ) {
         let acceptanceHintLabel = suggestionSettings.acceptanceHintLabel
         let visibleFrame = targetScreenVisibleFrame(for: geometry.caretRect)
@@ -537,6 +606,17 @@ final class OverlayController: SuggestionOverlayControlling {
         }
         panel.setFrame(panelFrame, display: true)
         panel.orderFrontRegardless()
+        logPlacement(
+            event: .mirrorShow,
+            geometry: geometry,
+            text: text,
+            renderMode: "mirror",
+            policyReason: reason.rawValue,
+            hysteresis: hysteresis,
+            fontSize: layout.fontSize,
+            panelFrame: panelFrame,
+            lineCount: 1
+        )
         // The card anchors to the field rect, not the caret, so there is no trustworthy typo
         // rectangle to strike here; keep the strikethrough an inline-only affordance.
         strikePanel.orderOut(nil)
@@ -547,13 +627,16 @@ final class OverlayController: SuggestionOverlayControlling {
     /// expose the full field frame; the extra ceiling prevents one bad estimate from rendering
     /// comically oversized ghost text. `caretHeight` is already floored to the per-session minimum
     /// by `ghostFontStabilizer`, so this only applies the static floor and quality ceilings.
+    /// Returns the rendered point size plus which resolution path produced it. The path is
+    /// telemetry ground truth — recorded at the decision site rather than re-inferred downstream,
+    /// so a "ghost is the wrong size" report can be attributed to the exact sizing branch.
     private func resolvedGhostFontSize(
         forCaretHeight caretHeight: CGFloat,
         caretQuality: CaretGeometryQuality,
         fieldFont: NSFont?,
         reportedPointSize: CGFloat?,
         estimatedPointSize: CGFloat?
-    ) -> CGFloat {
+    ) -> (size: CGFloat, path: GhostPlacementTelemetry.FontPath) {
         // The ghost's SIZE and the caret's POSITION quality are orthogonal: an estimated caret does
         // not make the host's declared 13pt font any less 13pt. Deriving size from the caret/line box
         // instead over-sizes ghost text in fields that render with generous line spacing — the box is
@@ -562,13 +645,18 @@ final class OverlayController: SuggestionOverlayControlling {
         //   • the host's own reported size (any position quality — it's a direct AX fact), else
         //   • for a layout-estimated caret, the size the estimator already resolved and laid out with.
         // Only when the host reveals no size at all do we fall back to caret-height derivation.
-        let trustedPointSize: CGFloat? = {
-            if let reportedPointSize, reportedPointSize > 0 { return reportedPointSize }
-            if caretQuality == .layoutEstimated, let estimatedPointSize, estimatedPointSize > 0 {
-                return estimatedPointSize
-            }
-            return nil
-        }()
+        let trustedPointSize: CGFloat?
+        let trustedPath: GhostPlacementTelemetry.FontPath?
+        if let reportedPointSize, reportedPointSize > 0 {
+            trustedPointSize = reportedPointSize
+            trustedPath = .trustedReported
+        } else if caretQuality == .layoutEstimated, let estimatedPointSize, estimatedPointSize > 0 {
+            trustedPointSize = estimatedPointSize
+            trustedPath = .trustedLayoutEstimated
+        } else {
+            trustedPointSize = nil
+            trustedPath = nil
+        }
 
         let qualityCap: CGFloat
         if trustedPointSize != nil {
@@ -587,7 +675,7 @@ final class OverlayController: SuggestionOverlayControlling {
             )
         }
 
-        return GhostFontMetrics.pointSize(
+        let size = GhostFontMetrics.pointSize(
             caretHeight: caretHeight,
             fieldMetrics: fieldMetrics,
             fallbackRatio: Layout.fontToLineHeightRatio,
@@ -595,6 +683,55 @@ final class OverlayController: SuggestionOverlayControlling {
             maximum: qualityCap,
             sizeMultiplier: CGFloat(suggestionSettings.ghostTextSizeMultiplier),
             trustedPointSize: trustedPointSize
+        )
+        let path = trustedPath
+            ?? (GhostFontMetrics.usesMetricRatio(fieldMetrics) ? .caretDerived : .fallbackRatio)
+        return (size, path)
+    }
+
+    /// Emits one `stage: "overlay-present"` JSONL record. The level check runs before any metadata
+    /// dictionary is built so the per-keystroke show path pays nothing in release, where the floor
+    /// is `.info` and `.debug` records are skipped entirely.
+    private func logPlacement(
+        event: GhostPlacementTelemetry.Event,
+        geometry: SuggestionOverlayGeometry,
+        text: String,
+        renderMode: String? = nil,
+        policyReason: String? = nil,
+        hysteresis: GhostPlacementTelemetry.Hysteresis? = nil,
+        fontPath: GhostPlacementTelemetry.FontPath? = nil,
+        fontName: String? = nil,
+        fontSize: CGFloat? = nil,
+        glyphBoxHeight: CGFloat? = nil,
+        lineHeight: CGFloat? = nil,
+        panelFrame: CGRect? = nil,
+        contentHeight: CGFloat? = nil,
+        lineCount: Int? = nil,
+        advanceShift: CGFloat? = nil,
+        hideReason: String? = nil
+    ) {
+        guard CotabbyDebugOptions.minimumLogLevel <= .debug else { return }
+        CotabbyLogger.suggestion.debug(
+            "Overlay placement \(event.rawValue)",
+            metadata: GhostPlacementTelemetry.metadata(
+                event: event,
+                presentation: lastPresentationContext,
+                geometry: geometry,
+                text: text,
+                renderMode: renderMode,
+                policyReason: policyReason,
+                hysteresis: hysteresis,
+                fontPath: fontPath,
+                fontName: fontName,
+                fontSize: fontSize,
+                glyphBoxHeight: glyphBoxHeight,
+                lineHeight: lineHeight,
+                panelFrame: panelFrame,
+                contentHeight: contentHeight,
+                lineCount: lineCount,
+                advanceShift: advanceShift,
+                hideReason: hideReason
+            )
         )
     }
 

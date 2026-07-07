@@ -231,12 +231,34 @@ protocol EmojiPickerPanelPresenting: AnyObject {
     func hide()
 }
 
+/// Presentation-scoped identifiers the overlay controller cannot derive itself, carried alongside
+/// the geometry purely for placement telemetry. Deliberately NOT part of
+/// `SuggestionOverlayGeometry`: that struct is `Equatable` and both the presenter's re-present
+/// dedup and the controller's caret-quality hysteresis compare geometry values, so a per-request
+/// id there would defeat those comparisons and cause re-present churn.
+struct OverlayPresentationContext: Equatable, Sendable {
+    /// The prediction's `request_id`, so a placement record joins the generation that produced it.
+    let requestID: String?
+    let workID: UInt64
+    /// Bundle id of the host app being typed into (not Cotabby's own).
+    let hostBundleID: String?
+    /// Human-readable resolver-branch label for the caret (e.g. "derived primary").
+    let caretSource: String
+}
+
 @MainActor
 protocol SuggestionOverlayControlling: AnyObject {
     var state: OverlayState { get }
     var onStateChange: ((OverlayState) -> Void)? { get set }
 
     func showSuggestion(_ text: String, geometry: SuggestionOverlayGeometry)
+    /// Presentation-context-aware variant; the context feeds placement telemetry only and never
+    /// affects rendering. Defaulted below so test doubles only implement the two-argument form.
+    func showSuggestion(
+        _ text: String,
+        geometry: SuggestionOverlayGeometry,
+        presentation: OverlayPresentationContext?
+    )
     func hide(reason: String)
 
     /// Advances a visible single-line inline ghost to `remainingText` by sliding the panel right by
@@ -252,6 +274,16 @@ extension SuggestionOverlayControlling {
     /// Default: not supported, so conformers that do not render an inline panel (e.g. test doubles)
     /// transparently fall back to the caret-anchored present path.
     func advanceInline(to remainingText: String) -> Bool { false }
+
+    /// Default: drop the telemetry-only context, so conformers that do not log placement (test
+    /// doubles) keep compiling with just the two-argument `showSuggestion`.
+    func showSuggestion(
+        _ text: String,
+        geometry: SuggestionOverlayGeometry,
+        presentation: OverlayPresentationContext?
+    ) {
+        showSuggestion(text, geometry: geometry)
+    }
 }
 
 @MainActor
