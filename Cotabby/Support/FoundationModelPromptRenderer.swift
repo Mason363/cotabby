@@ -37,6 +37,12 @@ enum FoundationModelPromptRenderer {
                 + "quote the existing text.",
             "Match the existing language, register, casing, and punctuation. Continue the "
                 + "current sentence or thought rather than restarting it.",
+            // Anti-fabrication rule. A chat-tuned model asked to continue a factual sentence will
+            // confidently invent a name, number, date, or URL to finish it — the "pulls information
+            // out of nowhere" failure. Constrain it to what the text and provided context actually
+            // support so a blank is left for the user rather than a wrong guess.
+            "Only continue with details supported by the existing text or the provided context; "
+                + "do not invent facts, names, numbers, or links.",
             "Use clipboard or screen context only when it directly helps the next words."
         ]
 

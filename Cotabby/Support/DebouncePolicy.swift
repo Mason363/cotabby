@@ -31,10 +31,14 @@ nonisolated enum DebouncePolicy {
         guard let last = lastGenerationLatencyMilliseconds, last > 0 else {
             return fallback
         }
+        // Snappier fast tiers so generation starts almost immediately after a keystroke and, with
+        // streaming on, ghost text appears while the user is still typing. The slow tier stays calm:
+        // when the model is behind, a longer pause still prevents piling doomed generations that each
+        // cost a decode setup/teardown to cancel.
         switch last {
-        case ...70: return 15
-        case ...140: return 25
-        default: return 55
+        case ...70: return 6
+        case ...140: return 14
+        default: return 45
         }
     }
 }

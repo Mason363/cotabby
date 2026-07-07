@@ -8,7 +8,8 @@ final class TypoGateTests: XCTestCase {
         offer: Bool,
         automatic: Bool = false,
         typos: Set<String> = [],
-        corrections: [String: String] = [:]
+        corrections: [String: String] = [:],
+        stems: Set<String> = []
     ) -> TypoGateDecision {
         TypoGate.resolve(
             precedingText: precedingText,
@@ -18,8 +19,52 @@ final class TypoGateTests: XCTestCase {
                 automaticallyFixTypos: automatic
             ),
             isTypo: { typos.contains($0) },
-            bestCorrection: { corrections[$0] }
+            bestCorrection: { corrections[$0] },
+            isWordStem: { stems.contains($0) }
         )
+    }
+
+    // MARK: - Word-in-progress stems are not typos
+
+    func test_proceedsForWordStemStillBeingTyped() {
+        // "whe" flags as a typo but is a prefix of "when": while the caret is still at its end the
+        // gate must stand down (no strike, no suppression) and let a normal continuation run.
+        let decision = resolve(
+            precedingText: "I wonder whe",
+            suppress: true,
+            offer: true,
+            typos: ["whe"],
+            corrections: ["whe": "the"],
+            stems: ["whe"]
+        )
+        XCTAssertEqual(decision, .proceed)
+    }
+
+    func test_stemProtectionEndsAtTheWordBoundary() {
+        // Once the user types Space the word is finished; a stem that never became a word is now a
+        // real typo and the correction may be offered.
+        let decision = resolve(
+            precedingText: "I wonder whe ",
+            suppress: true,
+            offer: true,
+            typos: ["whe"],
+            corrections: ["whe": "when"],
+            stems: ["whe"]
+        )
+        XCTAssertEqual(decision, .offerCorrection(word: "whe", correctedWord: "when"))
+    }
+
+    func test_hopelessMidWordTokenStillGates() {
+        // A mid-word token that is NOT a stem of anything ("nmae") keeps the old behavior.
+        let decision = resolve(
+            precedingText: "hi my nmae",
+            suppress: true,
+            offer: true,
+            typos: ["nmae"],
+            corrections: ["nmae": "name"],
+            stems: []
+        )
+        XCTAssertEqual(decision, .offerCorrection(word: "nmae", correctedWord: "name"))
     }
 
     func test_proceedsWhenSuppressionDisabled() {

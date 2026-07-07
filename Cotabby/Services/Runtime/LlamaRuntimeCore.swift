@@ -426,6 +426,43 @@ nonisolated final class LlamaRuntimeCore: @unchecked Sendable {
             }
         }
 
+        // Budget exhausted mid-word: a hard cut at the token budget shows the user a typo
+        // ("implemen" for "implement"). Overrun a few extra tokens until the word completes: a
+        // sampled piece that *starts* with a boundary character proves the word was already whole,
+        // and is discarded rather than appended (same discard precedent as the argmax-EOG stop).
+        if stopReason == "budget_exhausted",
+           let lastCharacter = generatedText.last, lastCharacter.isLetter || lastCharacter.isNumber {
+            for _ in 0 ..< Self.midWordCompletionOverrunTokens {
+                if Task.isCancelled {
+                    stopReason = "cancelled"
+                    break
+                }
+                let result = engine.sampleNext(sequenceID)
+                if result.was_cancelled {
+                    stopReason = "engine_cancelled"
+                    engineCancelled = true
+                    break
+                }
+                if result.is_eos {
+                    stopReason = "eos"
+                    break
+                }
+                if options.stopAtArgmaxEOG, result.argmax_is_eog {
+                    stopReason = "argmax_eog"
+                    break
+                }
+                let piece = Self.extractPiece(result)
+                if let first = piece.first, !first.isLetter, !first.isNumber {
+                    stopReason = "word_completed"
+                    break
+                }
+                generatedText += piece
+                tokensGenerated += 1
+                sumLogprob += Double(result.logprob)
+                onPartialRawText?(generatedText)
+            }
+        }
+
         CotabbyLogger.runtime.debug(
             "Decode end",
             metadata: [
@@ -717,6 +754,11 @@ nonisolated final class LlamaRuntimeCore: @unchecked Sendable {
     /// different ghost text run to run; a stable nonzero seed removes that variance. Requests can
     /// still override via `LlamaGenerationOptions.seed` (used by tests and microbenches).
     private static let defaultSamplerSeed: UInt32 = 0x00C0_FFEE
+
+    /// Extra tokens the decoder may spend past the prediction budget to finish the word it is in
+    /// the middle of. Small on purpose: it exists to turn "implemen" into "implement", not to grow
+    /// the suggestion. English words rarely need more than a few subword pieces to close.
+    private static let midWordCompletionOverrunTokens = 8
 
     private static func samplingConfig(from options: LlamaGenerationOptions) -> SamplingConfig {
         SamplingConfig(

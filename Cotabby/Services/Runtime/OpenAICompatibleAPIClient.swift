@@ -293,7 +293,7 @@ private nonisolated struct ChatCompletionRequest: Encodable {
         messages = [Message(
             role: "user",
             content: "Continue the text at the end of the context. Reply with only new continuation " +
-                "text; do not repeat or quote existing text.\n\n" + prompt
+                "text; do not repeat or quote existing text, do not invent facts, and add no filler.\n\n" + prompt
         )]
         maxTokens = options.maxPredictionTokens
         temperature = options.temperature

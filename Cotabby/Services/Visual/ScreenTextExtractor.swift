@@ -171,14 +171,18 @@ struct ScreenTextExtractor: ScreenTextExtracting {
                     }
                 }
 
-                // Accurate OCR is slower, but visual context is only captured once per focused
-                // field and the result can materially improve autocomplete relevance. Language
-                // correction is on for the same reason: it cuts garbled recognitions at the
-                // source, which matters because this text conditions the prompt and the
-                // downstream hygiene filters can only drop junk, not repair it.
-                request.recognitionLevel = .accurate
+                // Speed-first recognition. Visual context is a background enrichment — it is injected
+                // when ready and never blocks the first suggestion — so the user's stated priority
+                // here is latency parity with faster OCR tools, not archival fidelity. `.fast` is
+                // several times quicker than `.accurate`; keeping language correction on recovers most
+                // of the accuracy it trades, and the downstream `OCRTextHygiene` pass drops whatever
+                // garble still slips through. Net: the context stays useful while the Vision pass, the
+                // dominant cost of this pipeline, gets dramatically cheaper.
+                request.recognitionLevel = .fast
                 request.usesLanguageCorrection = true
-                request.minimumTextHeight = 0.008
+                // Ignore sub-1.2%-height glyphs (status bars, tiny chrome): they are almost never the
+                // on-topic context we want and each one is extra recognition work.
+                request.minimumTextHeight = 0.012
 
                 do {
                     let handler = VNImageRequestHandler(cgImage: preparedImage, options: [:])

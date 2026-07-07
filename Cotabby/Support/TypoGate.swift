@@ -30,15 +30,16 @@ enum TypoGate {
 
     /// Resolves the gate decision for the trailing word of `precedingText`.
     ///
-    /// `isTypo` and `bestCorrection` are injected so this stays pure: in production they wrap
-    /// `CurrentWordSpellChecker`; in tests they are stubs. Automatic fixing takes precedence only
-    /// after a literal trailing Space. Before that boundary the gate may offer a correction, but never
-    /// mutates an unfinished word merely because the user paused.
+    /// `isTypo`, `bestCorrection`, and `isWordStem` are injected so this stays pure: in production
+    /// they wrap `CurrentWordSpellChecker`; in tests they are stubs. Automatic fixing takes precedence
+    /// only after a literal trailing Space. Before that boundary the gate may offer a correction, but
+    /// never mutates an unfinished word merely because the user paused.
     static func resolve(
         precedingText: String,
         settings: Settings,
         isTypo: (String) -> Bool,
-        bestCorrection: (String) -> String?
+        bestCorrection: (String) -> String?,
+        isWordStem: (String) -> Bool = { _ in false }
     ) -> TypoGateDecision {
         guard settings.suppressCompletionsOnTypo else {
             return .proceed
@@ -49,6 +50,15 @@ enum TypoGate {
             return .proceed
         }
         guard isTypo(current.result.word) else {
+            return .proceed
+        }
+        // A word the user is STILL TYPING (caret at its end, no boundary typed yet) is not a typo if
+        // it can still become a real word: "remem" is on its way to "remember", "Swi" to "Swift",
+        // "whe" to "when". Gating those suppressed completions on nearly every long word mid-flight
+        // and struck through words the user had not finished. Only a word boundary makes the word
+        // judgeable; before that, a dictionary-prefix stem passes through to a normal continuation
+        // (which is also exactly the completion the user wants for it).
+        if current.trailingSpaceCount == 0, isWordStem(current.result.word) {
             return .proceed
         }
         guard let corrected = bestCorrection(current.result.word) else {

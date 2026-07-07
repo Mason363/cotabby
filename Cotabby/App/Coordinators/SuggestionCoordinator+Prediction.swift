@@ -14,7 +14,13 @@ extension SuggestionCoordinator {
     /// also tripping.
     static let freshSnapshotReuseWindowMilliseconds = 30
 
-    func schedulePrediction(consumedDelayMilliseconds: Int = 0) {
+    /// How long after a delete keystroke the instant anchor-cache re-show stays suppressed. Sized to
+    /// span the key-repeat cadence of a held backspace (~30–60ms between repeats) with margin, so a
+    /// burst keeps the overlay hidden until deleting settles, while a single delete's re-show is
+    /// delayed by at most this window.
+    static let deletionReshowSuppressionWindowSeconds: TimeInterval = 0.12
+
+    func schedulePrediction(consumedDelayMilliseconds: Int = 0, preservingInFlightGeneration: Bool = false) {
         // Any normal reschedule supersedes an outstanding speculative bet (its work id retires the
         // in-flight task; this retires the signature exemption so a late result cannot sneak in).
         pendingSpeculativeSignature = nil
@@ -40,8 +46,12 @@ extension SuggestionCoordinator {
 
         // Task cancellation in Swift is cooperative, so we also use an explicit work id.
         // That gives us strict "latest request wins" semantics even if an old task wakes up late.
+        // `preservingInFlightGeneration` (insertion keystrokes) supersedes the running decode
+        // without aborting it, so its completed result can be salvaged against the newer text —
+        // this is what lets ghost text appear WHILE the user types instead of only after a pause.
         let workID = workController.replaceDebouncedWork(
-            delayMilliseconds: remainingDelay
+            delayMilliseconds: remainingDelay,
+            preservingInFlightGeneration: preservingInFlightGeneration
         ) { [weak self] workID in
             await self?.generateFromCurrentFocus(workID: workID)
         }
@@ -93,6 +103,20 @@ extension SuggestionCoordinator {
             return
         }
 
+        // Frequency control: at calmer settings, hold suggestions back until the caret reaches a more
+        // meaningful position instead of firing on every keystroke. `.often` (the default) always
+        // passes, so shipped behavior is unchanged unless the user picks a lower setting.
+        guard SuggestionFrequencyPolicy.allows(
+            precedingText: rawContext.precedingText,
+            trailingText: rawContext.trailingText,
+            frequency: SuggestionFrequencyPolicy.current(from: userDefaults)
+        ) else {
+            clearSuggestion()
+            hideOverlay(reason: "Overlay hidden because the suggestion-frequency setting held this keystroke back.")
+            state = .idle
+            return
+        }
+
         // Typo gate: before building a normal continuation, check the current word with
         // NSSpellChecker. A misspelled word either suppresses the continuation (so completions never
         // pile onto a broken word), presents a green correction, or automatically fixes a completed
@@ -103,6 +127,14 @@ extension SuggestionCoordinator {
         }
 
         let context = interactionState.materializeContext(from: rawContext)
+        // Learn durable facts about the writer from what they have typed, so later suggestions can be
+        // conditioned on who they are. Model-driven only: this just buffers a snapshot of the text;
+        // the distillation generation runs once the user goes idle, so learning never adds latency to
+        // a live suggestion. Guarded on the opt-out and never run on secure fields.
+        if !context.isSecure, UserMemoryStore.isEnabled(defaults: userDefaults) {
+            userMemoryDistiller.record(text: context.precedingText)
+            scheduleMemoryDistillationOnIdle(context: context)
+        }
         // A cached suggestion consistent with the live text re-shows instantly: no debounce paid,
         // no model run. Covers backspace rollback, type-through re-entry, and field return.
         if restoreSuggestionFromAnchorCache(context: context, workID: workID) {
@@ -119,7 +151,8 @@ extension SuggestionCoordinator {
             settings: settingsSnapshot,
             configuration: configuration,
             clipboardContext: clipboardContext,
-            visualContextSummary: visualContextSummary
+            visualContextSummary: visualContextSummary,
+            learnedProfileContext: learnedProfileContext
         )
         latestGenerationNumber = context.generation
         latestPromptPreview = requestBuildResult.promptPreview
@@ -139,12 +172,101 @@ extension SuggestionCoordinator {
         dispatchGeneration(request: request, workID: workID)
     }
 
+    /// Debounces a distillation pass to the moment the user goes idle. Cancelled and rescheduled on
+    /// every generation, so the model is only asked to distill memory once typing has actually paused
+    /// — never mid-burst, where it would queue behind (and delay) a live suggestion on the serialized
+    /// runtime.
+    private func scheduleMemoryDistillationOnIdle(context: FocusedInputContext) {
+        memoryDistillIdleTask?.cancel()
+        memoryDistillIdleTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.memoryDistillIdleDelayNanoseconds)
+            guard !Task.isCancelled else { return }
+            await self?.runMemoryDistillationIfDue(context: context)
+        }
+    }
+
+    /// Spends one local generation to distill higher-level facts from the rolling buffer, then merges
+    /// them through the same weighted store as the deterministic extractor. Best-effort: every guard
+    /// failure or thrown error is a silent no-op. Restricted to the fully-local llama engine so the
+    /// buffered text never leaves the machine, and skipped while a suggestion is generating.
+    private func runMemoryDistillationIfDue(context: FocusedInputContext) async {
+        guard !isDistillingMemory else { return }
+        guard UserMemoryStore.isEnabled(defaults: userDefaults) else { return }
+        guard settingsSnapshot.selectedEngine == .llamaOpenSource else { return }
+        if case .generating = state { return }
+
+        let now = Date()
+        guard userMemoryDistiller.isDue(now: now), let prompt = userMemoryDistiller.makePrompt() else { return }
+        // Snapshot the buffer the prompt was built from: parse grounds every candidate against it, and
+        // the live buffer may grow while the generation is awaited.
+        let promptBuffer = userMemoryDistiller.buffer
+
+        // Mark before awaiting so a second idle tick during the generation cannot double-run, and a
+        // barren buffer is not retried every idle window.
+        isDistillingMemory = true
+        userMemoryDistiller.markDistilled(now: now)
+        defer { isDistillingMemory = false }
+
+        do {
+            let result = try await suggestionEngine.generateSuggestion(
+                for: makeDistillationRequest(prompt: prompt, context: context)
+            )
+            let candidates = userMemoryDistiller.parse(result.rawText, buffer: promptBuffer)
+            if !candidates.isEmpty {
+                userMemoryStore.ingest(candidates)
+            }
+        } catch {
+            // Distillation is a background luxury; a cancelled or failed generation changes nothing.
+        }
+    }
+
+    /// Builds a bare completion request carrying the distillation prompt. Reuses the current focus
+    /// context only to satisfy the request type; the prompt is what the engine acts on. Low
+    /// temperature keeps the fact list deterministic, and multi-line is on so several "category:
+    /// value" lines survive normalization.
+    private func makeDistillationRequest(prompt: String, context: FocusedInputContext) -> SuggestionRequest {
+        SuggestionRequest(
+            context: context,
+            prefixText: "",
+            prompt: prompt,
+            generation: 0,
+            maxPredictionTokens: 96,
+            temperature: 0.2,
+            topK: configuration.topK,
+            topP: configuration.topP,
+            minP: configuration.minP,
+            repetitionPenalty: configuration.repetitionPenalty,
+            randomSeed: nil,
+            maxSuffixCharacters: 0,
+            completionLengthInstruction: "",
+            userName: nil,
+            customRules: [],
+            extendedContext: nil,
+            learnedProfile: nil,
+            languageInstruction: nil,
+            clipboardContext: nil,
+            visualContextSummary: nil,
+            surfaceContext: nil,
+            isMultiLineEnabled: true,
+            requestID: RequestID.generate()
+        )
+    }
+
     /// Re-shows the freshest cached suggestion consistent with the live text, if any survives the
     /// same display guards a fresh generation passes. Returns true when a suggestion was restored
     /// (the caller skips generation entirely). The win is exactly the common editing moments:
     /// deleting a typo, retyping suggested words after an invalidation, returning to a field.
     private func restoreSuggestionFromAnchorCache(context: FocusedInputContext, workID: UInt64) -> Bool {
         guard !userDefaults.bool(forKey: Self.anchorReuseDisabledDefaultsKey) else { return false }
+        // Stand down during a hold-to-repeat backspace burst: re-showing the cached suggestion at
+        // each intermediate caret is what teleports the overlay in fields whose caret geometry is
+        // estimated. Once deleting settles past this window, the normal generation re-shows cleanly at
+        // the final caret. A single, isolated delete falls outside the window on its next keystroke,
+        // so ordinary rollback re-show is preserved.
+        if let lastDeletionAt,
+           Date().timeIntervalSince(lastDeletionAt) < Self.deletionReshowSuppressionWindowSeconds {
+            return false
+        }
         guard context.selection.length == 0, !context.isSecure else { return false }
         guard let remainder = suggestionAnchorCache.remainder(
             identityKey: context.focusedInputIdentityKey,
@@ -239,7 +361,8 @@ extension SuggestionCoordinator {
             settings: settingsSnapshot,
             configuration: configuration,
             clipboardContext: clipboardContext,
-            visualContextSummary: visualContextSummary
+            visualContextSummary: visualContextSummary,
+            learnedProfileContext: learnedProfileContext
         )
         latestGenerationNumber = context.generation
         latestPromptPreview = requestBuildResult.promptPreview
@@ -295,7 +418,15 @@ extension SuggestionCoordinator {
                     for: request,
                     onPartial: onPartial
                 )
-                guard !Task.isCancelled, self.workController.isCurrent(workID) else {
+                guard !Task.isCancelled else {
+                    return
+                }
+                guard self.workController.isCurrent(workID) else {
+                    // Superseded by newer keystrokes but completed (insertion keystrokes preserve
+                    // the in-flight decode; see SuggestionWorkController). If the user typed
+                    // exactly what this result predicts, its tail is still the right suggestion —
+                    // salvage it instead of discarding a finished decode.
+                    self.salvageStaleResult(result, request: request)
                     return
                 }
 
@@ -357,6 +488,44 @@ extension SuggestionCoordinator {
     /// 10-50ms from the engine, and rendering each one would stack session updates and overlay
     /// layout on the main actor; latest-wins coalescing bounds that work while the authoritative
     /// final result still arrives through `apply`.
+    /// Salvages a completed-but-superseded generation: seam-corrects it against the text it was
+    /// generated FROM, records it in the anchor cache, and immediately attempts the same cached
+    /// re-show a fresh keystroke would get. During continuous typing every generation is superseded
+    /// before it can apply, so without salvage nothing ever reached the screen until the user
+    /// paused; with it, a decode that finishes mid-burst pops in the moment the typed characters
+    /// match its prediction, and the queued newer generation refines it afterwards.
+    private func salvageStaleResult(_ result: SuggestionResult, request: SuggestionRequest) {
+        guard !result.text.isEmpty else { return }
+        let originContext = request.context
+        guard !originContext.isSecure else { return }
+        // Seam-correct against the ORIGIN text: the cache anchors (origin preceding text → full
+        // suggestion), and the remainder math then handles whatever the user typed since.
+        let seamText = CompletionSeamSpacing.normalized(
+            completion: result.text,
+            precedingText: originContext.precedingText,
+            isKnownWord: { !spellChecker.isTypo($0) }
+        )
+        guard !seamText.isEmpty else { return }
+        suggestionAnchorCache.record(
+            identityKey: originContext.focusedInputIdentityKey,
+            precedingText: originContext.precedingText,
+            fullText: seamText
+        )
+        // Never stomp a ghost the user is already typing through.
+        guard interactionState.activeSession == nil else { return }
+        guard let rawContext = focusModel.snapshot.context else { return }
+        let liveContext = interactionState.materializeContext(from: rawContext)
+        if restoreSuggestionFromAnchorCache(context: liveContext, workID: currentWorkID) {
+            logStage(
+                "salvage-restore",
+                workID: currentWorkID,
+                generation: liveContext.generation,
+                message: "Showed a superseded generation's tail that matches the typed text.",
+                normalizedOutput: seamText
+            )
+        }
+    }
+
     private func queueStreamedPartial(_ partial: SuggestionResult, workID: UInt64) {
         guard workController.isCurrent(workID) else {
             return
@@ -449,7 +618,8 @@ extension SuggestionCoordinator {
                     for: $0,
                     precedingText: rawContext.precedingText
                 )
-            }
+            },
+            isWordStem: { spellChecker.isPossibleWordStem($0) }
         ) {
         case .proceed:
             return false
@@ -596,7 +766,8 @@ extension SuggestionCoordinator {
             at: liveContext.caretRect,
             context: liveContext,
             isRightToLeft: TextDirectionDetector.isRightToLeft(liveContext.precedingText),
-            isCorrection: true
+            isCorrection: true,
+            replacedText: typoWord
         )
         logStage(
             "typo-correction-ready",
@@ -778,6 +949,17 @@ extension SuggestionCoordinator {
             return
         }
 
+        // Decide the seam space deterministically from the text instead of trusting the model's
+        // leading space (which splits fragments and glues new words in equal measure). Reuses the
+        // same spell checker as the seam guard above, and is the single source of the leading space
+        // for the session, so the displayed ghost and the inserted text agree — and a typed space can
+        // never double.
+        let seamText = CompletionSeamSpacing.normalized(
+            completion: result.text,
+            precedingText: liveContext.precedingText,
+            isKnownWord: { !spellChecker.isTypo($0) }
+        )
+
         latestLatencyMilliseconds = Int(result.latency * 1000)
         latestGenerationNumber = liveContext.generation
         // One shown event per suggestion: this is the only place a fresh generation becomes
@@ -786,10 +968,10 @@ extension SuggestionCoordinator {
         suggestionAnchorCache.record(
             identityKey: liveContext.focusedInputIdentityKey,
             precedingText: liveContext.precedingText,
-            fullText: result.text
+            fullText: seamText
         )
         let session = interactionState.startSession(
-            fullText: result.text,
+            fullText: seamText,
             liveContext: liveContext,
             latency: result.latency
         )

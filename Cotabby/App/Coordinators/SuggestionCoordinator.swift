@@ -143,6 +143,31 @@ final class SuggestionCoordinator: ObservableObject {
     /// the stale-frame kind, so older backward corrections stay re-anchorable.
     var lastAcceptanceAt: Date?
 
+    /// Wall-clock moment of the most recent delete/backspace keystroke. The instant anchor-cache
+    /// re-show stands down for a short window after this so a hold-to-repeat backspace burst does not
+    /// flicker the overlay across every intermediate (often estimated) caret — the "teleporting when
+    /// I hold backspace" report. The settled generation re-shows once deleting stops.
+    var lastDeletionAt: Date?
+
+    /// On-device profile Cotabby learns from what the user types, injected as a stable "About the
+    /// writer: …" line at the head of each prompt so suggestions are conditioned on who they are.
+    /// Opt-out via `UserMemoryStore.isEnabled`; wiped via `UserMemoryStore.clearNotification`.
+    /// Constructed in `init` because it needs the injected `userDefaults`.
+    let userMemoryStore: UserMemoryStore
+
+    /// The model-distillation half of learned memory: a rolling buffer of recent writing plus a
+    /// throttle. The engine call it drives is scheduled only after the user goes idle
+    /// (`scheduleMemoryDistillationOnIdle`), so it never competes with a live suggestion for the
+    /// serialized runtime, and its output flows through the same weighted store as the extractor.
+    var userMemoryDistiller = UserMemoryDistiller()
+    /// Idle-debounce token for distillation: cancelled and rescheduled on every generation, so it
+    /// fires only once typing has actually paused.
+    var memoryDistillIdleTask: Task<Void, Never>?
+    /// Guards against two distillation runs overlapping on the serialized engine.
+    var isDistillingMemory = false
+    /// How long the user must be idle (no new generation) before a distillation pass may run.
+    static let memoryDistillIdleDelayNanoseconds: UInt64 = 6_000_000_000
+
     /// Bounded string-only memory of recent suggestions for instant re-show on rollback and
     /// re-entry (see `SuggestionAnchorCache`). `cotabbyAnchorReuseDisabled` is the kill switch.
     var suggestionAnchorCache = SuggestionAnchorCache()
@@ -212,6 +237,7 @@ final class SuggestionCoordinator: ObservableObject {
         self.spellingLanguageResolver = spellingLanguageResolver
         self.qualityMetricsStore = qualityMetricsStore
         self.userDefaults = userDefaults
+        userMemoryStore = UserMemoryStore(userDefaults: userDefaults)
         settingsSnapshot = suggestionSettings.snapshot
         // These collaborators isolate "how overlay/logging works" from "when the coordinator
         // wants to show state," which keeps the coordinator closer to orchestration code.
@@ -307,5 +333,13 @@ final class SuggestionCoordinator: ObservableObject {
     /// Exposes the latest cancellation token for the split extension files.
     var currentWorkID: UInt64 {
         workController.currentWorkID
+    }
+
+    /// The learned-profile line to condition the next request on, or nil when the feature is off or
+    /// nothing is confident yet. Read at every `buildRequest` call site so the prompt head stays
+    /// identical across the normal, speculative, and input-driven paths (identical head = the engine
+    /// keeps its reusable KV prefix instead of re-prefilling).
+    var learnedProfileContext: String? {
+        UserMemoryStore.isEnabled(defaults: userDefaults) ? userMemoryStore.digest() : nil
     }
 }

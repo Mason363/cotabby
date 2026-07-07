@@ -148,7 +148,8 @@ extension SuggestionCoordinator {
             let request = SuggestionRequestFactory.buildRequest(
                 context: prewarmContext,
                 settings: settings,
-                configuration: configuration
+                configuration: configuration,
+                learnedProfileContext: self.learnedProfileContext
             ).request
             await suggestionEngine.prewarm(for: request)
         }
@@ -173,6 +174,13 @@ extension SuggestionCoordinator {
             return false
         }
 
+        // Record delete keystrokes so the instant anchor-cache re-show can stand down during a
+        // hold-to-repeat backspace burst (see `restoreSuggestionFromAnchorCache`). Recorded before
+        // routing so it applies whether or not a session is active.
+        if event.isDeletion {
+            lastDeletionAt = Date()
+        }
+
         if event.kind == .acceptance {
             return acceptCurrentSuggestion()
         }
@@ -185,10 +193,23 @@ extension SuggestionCoordinator {
             return handleInputEvent(event, with: activeSession)
         }
 
+        // An insertion keystroke extends the text the in-flight decode was started from, so that
+        // decode's result is still salvageable (the user may be typing exactly what it predicts).
+        // Deletions, navigation, shortcuts, and dismissals genuinely invalidate the in-flight
+        // prefix and keep the hard cancel.
+        let isSalvageableInsertion = event.kind == .textMutation && !event.isDeletion
+
         if event.shouldClearSuggestion {
-            // Always kill pending work: a stale host-publish chain or debounce from the previous
-            // keystroke must not fire a prediction this event meant to cancel.
-            cancelPredictionWork()
+            if isSalvageableInsertion {
+                // Supersede without aborting: the reschedule below replaces the debounce (and the
+                // host-publish poll re-arms via its own generation token), while the running decode
+                // finishes for salvage. This is what lets ghost text appear WHILE the user types.
+                pendingSpeculativeSignature = nil
+            } else {
+                // Kill pending work: a stale host-publish chain or debounce from the previous
+                // keystroke must not fire a prediction this event meant to cancel.
+                cancelPredictionWork()
+            }
             if hasSuggestionArtifactsToClear {
                 clearSuggestion(clearDiagnostics: true)
                 hideOverlay(reason: SuggestionSessionReconciler.overlayHideReason(for: event))
@@ -204,7 +225,7 @@ extension SuggestionCoordinator {
             // reads pre-keystroke text and feeds it into generation. The result is a suggestion
             // that looks like the typed character was ignored — see
             // `schedulePredictionAfterHostPublishDelay` for the full rationale.
-            schedulePredictionAfterHostPublishDelay()
+            schedulePredictionAfterHostPublishDelay(preservingInFlightGeneration: isSalvageableInsertion)
         }
 
         return false
@@ -240,7 +261,7 @@ extension SuggestionCoordinator {
     /// `schedulePrediction()` internally `replaceDebouncedWork`s, so back-to-back keystrokes
     /// still collapse cleanly. The `hostPublishPollGeneration` token adds the missing outer
     /// coalescing layer: only the newest keystroke's polling chain may keep reading AX.
-    func schedulePredictionAfterHostPublishDelay() {
+    func schedulePredictionAfterHostPublishDelay(preservingInFlightGeneration: Bool = false) {
         hostPublishPollGeneration &+= 1
         let pollGeneration = hostPublishPollGeneration
         let baseline = focusModel.snapshot.context
@@ -266,7 +287,8 @@ extension SuggestionCoordinator {
                     keystrokeUptimeNanoseconds: keystrokeUptimeNanoseconds
                 ),
                 pollGeneration: pollGeneration,
-                elapsedMs: Self.hostPublishFirstPollIntervalMs
+                elapsedMs: Self.hostPublishFirstPollIntervalMs,
+                preservingInFlightGeneration: preservingInFlightGeneration
             )
         }
     }
@@ -286,7 +308,8 @@ extension SuggestionCoordinator {
     private func pollForHostPublish(
         baseline: HostPublishBaseline,
         pollGeneration: UInt64,
-        elapsedMs: Int
+        elapsedMs: Int,
+        preservingInFlightGeneration: Bool = false
     ) {
         guard pollGeneration == hostPublishPollGeneration else {
             return
@@ -323,7 +346,8 @@ extension SuggestionCoordinator {
             }
             pendingSpeculativeSignature = nil
             schedulePrediction(
-                consumedDelayMilliseconds: Self.elapsedMilliseconds(since: baseline.keystrokeUptimeNanoseconds)
+                consumedDelayMilliseconds: Self.elapsedMilliseconds(since: baseline.keystrokeUptimeNanoseconds),
+                preservingInFlightGeneration: preservingInFlightGeneration
             )
             return
         }
@@ -337,7 +361,8 @@ extension SuggestionCoordinator {
         let nextElapsed = elapsedMs + interval
         guard nextElapsed < Self.hostPublishWaitCeilingMs else {
             schedulePrediction(
-                consumedDelayMilliseconds: Self.elapsedMilliseconds(since: baseline.keystrokeUptimeNanoseconds)
+                consumedDelayMilliseconds: Self.elapsedMilliseconds(since: baseline.keystrokeUptimeNanoseconds),
+                preservingInFlightGeneration: preservingInFlightGeneration
             )
             return
         }
@@ -346,7 +371,8 @@ extension SuggestionCoordinator {
             self?.pollForHostPublish(
                 baseline: baseline,
                 pollGeneration: pollGeneration,
-                elapsedMs: nextElapsed
+                elapsedMs: nextElapsed,
+                preservingInFlightGeneration: preservingInFlightGeneration
             )
         }
     }

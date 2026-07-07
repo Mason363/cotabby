@@ -24,6 +24,7 @@ enum BaseCompletionPromptRenderer {
         userName: String?,
         customRules: [String] = [],
         extendedContext: String? = nil,
+        learnedProfile: String? = nil,
         languageInstruction: String? = nil,
         clipboardContext: String? = nil,
         visualContextSummary: String? = nil,
@@ -46,6 +47,14 @@ enum BaseCompletionPromptRenderer {
                     Self.contextSection("surface", lines.joined(separator: " "), priority: 70, maxChars: 240)
                 )
             }
+        }
+        // The learned profile sits right below the surface line and above the persona: it is the most
+        // durable, personal conditioning Cotabby has, and the digest only changes when a new fact
+        // crosses its confidence threshold, so at the prompt head it stays byte-stable across
+        // keystrokes and rides llama's KV-cache prefix reuse. Priority 65 keeps it above the persona
+        // (60) so it survives budget pressure. The digest already reads "About the writer: …".
+        if let profile = Self.nonEmpty(learnedProfile) {
+            sections.append(Self.contextSection("profile", profile, priority: 65, maxChars: 300))
         }
         if let persona = Self.personaLine(userName) {
             sections.append(Self.contextSection("persona", persona, priority: 60, maxChars: 200))

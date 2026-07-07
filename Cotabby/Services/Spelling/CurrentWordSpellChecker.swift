@@ -50,6 +50,21 @@ final class CurrentWordSpellChecker {
         return misspelledRange.length == (word as NSString).length
     }
 
+    /// True when `word` is a plausible *prefix* of a real dictionary word ("remem" → "remember",
+    /// "Swi" → "Swift", "whe" → "when"). The typo gate uses this to leave a word alone while the user
+    /// is still typing it: a stem is a word in progress, not a typo. Backed by `NSSpellChecker`'s own
+    /// completion list so detection and stem-ness come from the same dictionary.
+    func isPossibleWordStem(_ word: String) -> Bool {
+        guard !word.isEmpty else { return false }
+        let completions = NSSpellChecker.shared.completions(
+            forPartialWordRange: NSRange(location: 0, length: (word as NSString).length),
+            in: word,
+            language: nil,
+            inSpellDocumentWithTag: documentTag
+        )
+        return !(completions ?? []).isEmpty
+    }
+
     /// `NSSpellChecker`'s own ranked corrections for the word (best first), or an empty array when it
     /// has nothing to offer.
     func nativeCorrections(for word: String) -> [String] {

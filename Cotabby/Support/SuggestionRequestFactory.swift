@@ -34,7 +34,8 @@ enum SuggestionRequestFactory {
         settings: SuggestionSettingsSnapshot,
         configuration: SuggestionConfiguration,
         clipboardContext: String? = nil,
-        visualContextSummary: String? = nil
+        visualContextSummary: String? = nil,
+        learnedProfileContext: String? = nil
     ) -> SuggestionRequestBuildResult {
         let prefixText = truncatedPromptPrefix(
             from: context.precedingText,
@@ -66,6 +67,11 @@ enum SuggestionRequestFactory {
         let boundedVisualContextSummary = activeVisualContextSummary(
             rawSummary: visualContextSummary
         )
+        // The on-device learned profile ("About the writer: …"), already rendered by the memory
+        // store. nil when the feature is off or nothing is confident yet, so renderers skip it.
+        let trimmedLearnedProfile = (learnedProfileContext ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let activeLearnedProfile = trimmedLearnedProfile.isEmpty ? nil : trimmedLearnedProfile
         // The composed surface description; nil when the user disabled it or the surface class
         // suppresses it (code editors, terminals, anonymous generic apps). The composer sanitizes
         // titles/placeholders and reduces the URL to a bare domain before anything reaches a prompt.
@@ -92,6 +98,7 @@ enum SuggestionRequestFactory {
             userName: userName,
             customRules: customRules,
             extendedContext: activeExtendedContext,
+            learnedProfile: activeLearnedProfile,
             languageInstruction: languageInstruction,
             clipboardContext: boundedClipboardContext,
             visualContextSummary: boundedVisualContextSummary,
@@ -121,6 +128,7 @@ enum SuggestionRequestFactory {
             userName: userName,
             customRules: customRules,
             extendedContext: activeExtendedContext,
+            learnedProfile: activeLearnedProfile,
             languageInstruction: languageInstruction,
             clipboardContext: boundedClipboardContext,
             visualContextSummary: boundedVisualContextSummary,

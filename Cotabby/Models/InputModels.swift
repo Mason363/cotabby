@@ -72,4 +72,11 @@ struct CapturedInputEvent: Equatable {
             return false
         }
     }
+
+    /// Backspace (51) or forward-delete (117): a text mutation that removes rather than adds. Used to
+    /// stand the instant anchor-cache re-show down during a hold-to-repeat delete burst, where
+    /// chasing each intermediate (often estimated) caret is what teleports the overlay around.
+    var isDeletion: Bool {
+        kind == .textMutation && (keyCode == 51 || keyCode == 117)
+    }
 }

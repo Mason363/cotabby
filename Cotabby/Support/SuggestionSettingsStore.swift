@@ -296,10 +296,13 @@ struct SuggestionSettingsStore {
         // Accessibility read per field. Users who want fully context-free prompts can switch it off.
         let resolvedSurfaceContextEnabled =
             userDefaults.object(forKey: Self.surfaceContextEnabledDefaultsKey) as? Bool ?? true
-        // Defaults to false so the visual-context pipeline keeps running for existing users; opting
-        // into fast mode turns it off.
+        // Defaults to true: Fast Mode skips the screenshot + OCR visual-context pipeline, which is a
+        // large source of both latency and off-topic conditioning (the model gets "Nearby on screen:
+        // <whatever the OCR scraped>" folded into every prompt). Keeping completions grounded in the
+        // text the user is actually writing makes them faster and much more on-topic; the screen
+        // context is opt-out via the Fast Mode toggle for the cases where it genuinely helps.
         let resolvedFastModeEnabled =
-            userDefaults.object(forKey: Self.fastModeEnabledDefaultsKey) as? Bool ?? false
+            userDefaults.object(forKey: Self.fastModeEnabledDefaultsKey) as? Bool ?? true
         // Hiding a completion on a misspelled current word and offering a fix remain the default
         // behavior. Automatic replacement is deliberately opt-in because it mutates host-app text
         // without a confirmation key.
@@ -402,8 +405,12 @@ struct SuggestionSettingsStore {
         // trailing space is opt-in from Settings.
         let resolvedAddSpaceAfterAccept =
             userDefaults.object(forKey: Self.addSpaceAfterAcceptDefaultsKey) as? Bool ?? false
-        // Defaults to false so the suggestion appears once, fully formed; token-by-token streaming
-        // is opt-in from Settings.
+        // Defaults to false. Token-by-token streaming reads as "live as you type" when caret geometry
+        // is solid, but on fields whose geometry Cotabby can only estimate (web editors, some native
+        // text areas) every partial re-anchors against a shaky position and the final result may be
+        // suppressed, which surfaces as ghost text that flashes in and blinks out. The once-fully-
+        // formed reveal is far more stable there, and the low debounce still makes it feel fast. Users
+        // who want the streaming reveal can opt back in from the menu.
         let resolvedStreamSuggestionsWhileGenerating =
             userDefaults.object(forKey: Self.streamWhileGeneratingDefaultsKey) as? Bool ?? false
         // Defaults to true: the gentle fade-in is the intended out-of-box feel. Users who prefer

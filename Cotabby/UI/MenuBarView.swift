@@ -30,12 +30,28 @@ struct MenuBarView: View {
     /// the popover behind them. SwiftUI's `\.dismiss` does not work for `MenuBarExtra(.window)`.
     @StateObject private var popoverDismisser = MenuBarPopoverDismisser()
 
+    /// Live show/hide state for the on-screen debug overlays. Backed by the same UserDefaults key the
+    /// debug overlay controller reads, so flipping it hides/shows the caret badge, frame outline, and
+    /// visual-context HUD on the next focus tick. Only surfaced in the debug build (see `debugSection`).
+    @AppStorage(CotabbyDebugOptions.overlaysVisibleDefaultsKey) private var debugOverlaysVisible = false
+
+    /// Opt-out for the on-device learned profile. Default `true` matches `UserMemoryStore.isEnabled`
+    /// (absent key = on), so the toggle and the generation path agree without writing a migration key.
+    @AppStorage(UserMemoryStore.enabledDefaultsKey) private var personalizeAsITypeEnabled = true
+
+    /// How eagerly ghost text appears. Default `.often` matches `SuggestionFrequencyPolicy.current`
+    /// (absent key = often), so the picker and the prediction gate agree without a migration key.
+    @AppStorage(SuggestionFrequencyPolicy.defaultsKey) private var suggestionFrequencyRaw = SuggestionFrequency.often.rawValue
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             headerSection
             Divider().padding(.bottom, 12)
             controlsSection
+            suggestionFrequencySection
+            personalizationSection
             permissionsCard
+            debugSection
             footerSection
         }
         .padding(16)
@@ -309,6 +325,88 @@ struct MenuBarView: View {
         }
     }
 
+    // MARK: - Suggestion frequency
+
+    /// Lets the user dial how eagerly ghost text appears. `.often` (default) keeps the historical
+    /// per-keystroke behavior; the lower settings reduce visual churn by holding suggestions back to
+    /// more meaningful caret positions. Read live by the prediction gate via the same defaults key.
+    @ViewBuilder
+    private var suggestionFrequencySection: some View {
+        Divider()
+            .padding(.top, 12)
+
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Suggestion frequency")
+                .font(.subheadline)
+
+            Picker("Suggestion frequency", selection: $suggestionFrequencyRaw) {
+                ForEach(SuggestionFrequency.allCases, id: \.self) { frequency in
+                    Text(frequency.label).tag(frequency.rawValue)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .controlSize(.small)
+
+            Toggle("Show suggestions as I type", isOn: streamSuggestionsBinding)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .padding(.top, 2)
+        }
+        .padding(.top, 8)
+    }
+
+    // MARK: - Personalization
+
+    /// User-facing control for the on-device learned profile: a toggle to stop learning, and a way to
+    /// wipe what has been learned. "Forget" posts `UserMemoryStore.clearNotification` so the live store
+    /// clears itself without the menu holding a reference to it (or to the coordinator).
+    @ViewBuilder
+    private var personalizationSection: some View {
+        Divider()
+            .padding(.top, 12)
+
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle("Personalize as I type", isOn: $personalizeAsITypeEnabled)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+
+            HStack(alignment: .firstTextBaseline) {
+                Text("Learns who you are on-device to keep suggestions on-topic. Never leaves your Mac.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Spacer(minLength: 8)
+
+                Button("Forget") {
+                    NotificationCenter.default.post(name: UserMemoryStore.clearNotification, object: nil)
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+            }
+        }
+        .padding(.top, 8)
+    }
+
+    // MARK: - Debug
+
+    /// Developer-only control, present only when the app was launched with `-cotabby-debug` (the Dev
+    /// scheme). Lets the on-screen debug overlays be hidden so the screen is clean for typing, then
+    /// brought back to inspect caret geometry — without relaunching. Absent in release builds.
+    @ViewBuilder
+    private var debugSection: some View {
+        if CotabbyDebugOptions.isEnabled {
+            Divider()
+                .padding(.top, 12)
+
+            Toggle("Show Debug Overlays", isOn: $debugOverlaysVisible)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .padding(.top, 8)
+        }
+    }
+
     // MARK: - Footer
 
     @ViewBuilder
@@ -347,6 +445,16 @@ struct MenuBarView: View {
         Binding(
             get: { suggestionSettings.isClipboardContextEnabled },
             set: { suggestionSettings.setClipboardContextEnabled($0) }
+        )
+    }
+
+    /// Streams ghost text token-by-token as the model decodes, so a suggestion appears while the user
+    /// is still typing rather than only after a full generation. Reads/writes the same setting the
+    /// store defaults on.
+    private var streamSuggestionsBinding: Binding<Bool> {
+        Binding(
+            get: { suggestionSettings.streamSuggestionsWhileGenerating },
+            set: { suggestionSettings.setStreamSuggestionsWhileGenerating($0) }
         )
     }
 

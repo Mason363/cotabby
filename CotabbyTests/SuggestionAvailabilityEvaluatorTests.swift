@@ -614,19 +614,20 @@ final class SuggestionSettingsModelDisabledAppsTests: XCTestCase {
         _ = cancellables
     }
 
-    func test_fastMode_defaultsToFalseAndPersists() {
+    func test_fastMode_defaultsToTrueAndPersists() {
         runOnMainActor {
             let userDefaults = makeUserDefaults()
             let model = makeModel(userDefaults: userDefaults)
 
-            XCTAssertFalse(model.isFastModeEnabled)
-            XCTAssertFalse(model.snapshot.isFastModeEnabled)
+            // Fast Mode ships on: the screenshot/OCR visual-context pipeline is opt-in, not default.
+            XCTAssertTrue(model.isFastModeEnabled)
+            XCTAssertTrue(model.snapshot.isFastModeEnabled)
 
-            model.setFastModeEnabled(true)
+            model.setFastModeEnabled(false)
             let reloadedModel = makeModel(userDefaults: userDefaults)
 
-            XCTAssertTrue(reloadedModel.isFastModeEnabled)
-            XCTAssertTrue(reloadedModel.snapshot.isFastModeEnabled)
+            XCTAssertFalse(reloadedModel.isFastModeEnabled)
+            XCTAssertFalse(reloadedModel.snapshot.isFastModeEnabled)
         }
     }
 
@@ -640,12 +641,13 @@ final class SuggestionSettingsModelDisabledAppsTests: XCTestCase {
             model.snapshotPublisher
                 .dropFirst()
                 .sink { snapshot in
-                    XCTAssertTrue(snapshot.isFastModeEnabled)
+                    // Default is now true, so toggling to false is the change under test.
+                    XCTAssertFalse(snapshot.isFastModeEnabled)
                     expectation.fulfill()
                 }
                 .store(in: &cancellables)
 
-            model.setFastModeEnabled(true)
+            model.setFastModeEnabled(false)
         }
 
         wait(for: [expectation], timeout: 1.0)
