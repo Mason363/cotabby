@@ -370,8 +370,7 @@ final class SuggestionCoordinatorPredictionTests: XCTestCase {
         XCTAssertTrue(rig.coordinator.acceptCurrentSuggestion())
 
         XCTAssertEqual(rig.overlayController.advanceInlineCalls.count, 1)
-        XCTAssertEqual(rig.overlayController.advanceInlineCalls.first?.remaining, " again")
-        XCTAssertEqual(rig.overlayController.advanceInlineCalls.first?.inserted, " world")
+        XCTAssertEqual(rig.overlayController.advanceInlineCalls.first, " again")
     }
 
     func test_accept_stampsTheAcceptanceAndInvalidatesTransientCaretCaches() {

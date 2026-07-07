@@ -166,4 +166,97 @@ final class GhostFontMetricsTests: XCTestCase {
         )
         XCTAssertEqual(size, GhostFontMetrics.absoluteMinimumPointSize, accuracy: 0.0001)
     }
+
+    // MARK: - Trusted reported point size
+
+    func testTrustedPointSizeRendersAtReportedSizeBypassingMinimumFloor() {
+        // The whole point of this path: an 11pt host must render 11pt ghost text, not get floored up
+        // to the 14pt minimum the caret-height approximation applies. Caret height is ignored here.
+        let size = GhostFontMetrics.pointSize(
+            caretHeight: 30,
+            fieldMetrics: metrics(pointSize: 11, ascender: 10, descender: -3),
+            fallbackRatio: fallbackRatio,
+            minimum: minimum,
+            maximum: maximum,
+            trustedPointSize: 11
+        )
+        XCTAssertEqual(size, 11, accuracy: 0.0001)
+    }
+
+    func testTrustedPointSizeIgnoresCaretHeight() {
+        // Two wildly different caret heights must yield the same size when the reported size is trusted,
+        // proving the caret-height derivation is fully bypassed.
+        let small = GhostFontMetrics.pointSize(
+            caretHeight: 8,
+            fieldMetrics: nil,
+            fallbackRatio: fallbackRatio,
+            minimum: minimum,
+            maximum: maximum,
+            trustedPointSize: 13
+        )
+        let large = GhostFontMetrics.pointSize(
+            caretHeight: 40,
+            fieldMetrics: nil,
+            fallbackRatio: fallbackRatio,
+            minimum: minimum,
+            maximum: maximum,
+            trustedPointSize: 13
+        )
+        XCTAssertEqual(small, 13, accuracy: 0.0001)
+        XCTAssertEqual(large, 13, accuracy: 0.0001)
+    }
+
+    func testTrustedPointSizeScaledByMultiplier() {
+        let size = GhostFontMetrics.pointSize(
+            caretHeight: 20,
+            fieldMetrics: nil,
+            fallbackRatio: fallbackRatio,
+            minimum: minimum,
+            maximum: maximum,
+            sizeMultiplier: 1.2,
+            trustedPointSize: 12
+        )
+        XCTAssertEqual(size, 12 * 1.2, accuracy: 0.0001)
+    }
+
+    func testTrustedPointSizeCappedByMaximum() {
+        // A host-reported size above the cap is still bounded so a bogus reading can't bloat the panel.
+        let size = GhostFontMetrics.pointSize(
+            caretHeight: 20,
+            fieldMetrics: nil,
+            fallbackRatio: fallbackRatio,
+            minimum: minimum,
+            maximum: maximum,
+            trustedPointSize: 60
+        )
+        XCTAssertEqual(size, maximum, accuracy: 0.0001)
+    }
+
+    func testTrustedPointSizeRespectsAbsoluteFloor() {
+        // A tiny reported size (or a small size shrunk by the multiplier) still cannot drop below the
+        // legibility backstop.
+        let size = GhostFontMetrics.pointSize(
+            caretHeight: 20,
+            fieldMetrics: nil,
+            fallbackRatio: fallbackRatio,
+            minimum: minimum,
+            maximum: maximum,
+            trustedPointSize: 5
+        )
+        XCTAssertEqual(size, GhostFontMetrics.absoluteMinimumPointSize, accuracy: 0.0001)
+    }
+
+    func testNonPositiveTrustedPointSizeFallsBackToCaretDerivation() {
+        // A zero/absent reported size must not be treated as trusted; the caret-height path takes over.
+        let size = GhostFontMetrics.pointSize(
+            caretHeight: 20,
+            fieldMetrics: nil,
+            fallbackRatio: fallbackRatio,
+            minimum: minimum,
+            maximum: maximum,
+            trustedPointSize: 0
+        )
+        // Falls back to max(14, 20 * 0.78) = 15.6.
+        XCTAssertEqual(size, 15.6, accuracy: 0.0001)
+    }
 }

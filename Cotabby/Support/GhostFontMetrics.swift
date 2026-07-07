@@ -33,14 +33,26 @@ enum GhostFontMetrics {
     /// make a "smaller" choice a no-op whenever the field already sits at `minimum`. Growth is bounded
     /// by the caller's clamped multiplier rather than a second ceiling here; only the absolute floor
     /// is re-applied so a low multiplier can never produce illegibly small text.
+    ///
+    /// `trustedPointSize` is the host's own reported point size, passed only when the caret geometry
+    /// is trustworthy (exact/derived) and the field actually exposed its font size. When present we
+    /// render at that size directly — scaled by the multiplier, capped by `maximum`, and floored by
+    /// the absolute backstop — instead of approximating from caret height. Deriving from caret height
+    /// floored dense body text up to `minimum` (14pt for an 11pt field), which is the main reason the
+    /// ghost read as a larger, different font; using the reported size makes it match glyph-for-glyph.
+    /// The caret-height derivation remains the path for untrusted geometry and unknown fonts.
     static func pointSize(
         caretHeight: CGFloat,
         fieldMetrics: FieldFontMetrics?,
         fallbackRatio: CGFloat,
         minimum: CGFloat,
         maximum: CGFloat,
-        sizeMultiplier: CGFloat = 1
+        sizeMultiplier: CGFloat = 1,
+        trustedPointSize: CGFloat? = nil
     ) -> CGFloat {
+        if let trustedPointSize, trustedPointSize > 0 {
+            return max(absoluteMinimumPointSize, min(trustedPointSize * sizeMultiplier, maximum))
+        }
         let ratio = metricRatio(fieldMetrics) ?? fallbackRatio
         let autoSize = min(max(minimum, caretHeight * ratio), maximum)
         return max(absoluteMinimumPointSize, autoSize * sizeMultiplier)

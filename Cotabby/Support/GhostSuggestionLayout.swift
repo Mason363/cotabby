@@ -23,11 +23,16 @@ struct GhostSuggestionLayout: Equatable {
     /// subtracts the content width to derive the actual AppKit origin.
     let panelOriginX: CGFloat
     let lineHeight: CGFloat
+    /// Natural glyph-box height (ascender − descender) of the render font, `lineHeight` when the
+    /// font is unknown. The row is taller than the glyph box (`lineHeightMultiplier` leading), and
+    /// the row centers its glyphs, so the glyphs float `(lineHeight − glyphBoxHeight) / 2` above the
+    /// row bottom; `panelFrame` subtracts exactly that so the glyphs — not the row box — land on the
+    /// caret line.
+    let glyphBoxHeight: CGFloat
     let topLineCenterOffsetFromCaret: CGFloat
     let isRightToLeft: Bool
 
     private enum Metrics {
-        static let caretGap: CGFloat = 6
         static let inputHorizontalPadding: CGFloat = 8
         static let fallbackScreenMargin: CGFloat = 16
         static let minimumLineWidth: CGFloat = 48
@@ -54,6 +59,10 @@ struct GhostSuggestionLayout: Equatable {
     ) -> GhostSuggestionLayout {
         let normalizedText = normalizedDisplayText(text)
         let lineHeight = ceil(fontSize * Metrics.lineHeightMultiplier)
+        // The render font's natural glyph-box height, for glyph-level (not box-level) vertical
+        // anchoring in `panelFrame`. Falls back to the row height when no font is known, which
+        // degrades to plain bottom-alignment there.
+        let glyphBoxHeight = font.map { $0.ascender - $0.descender } ?? lineHeight
         let isRTL = geometry.isRightToLeft
         let measure = TextMeasure(
             fontSize: fontSize,
@@ -67,25 +76,24 @@ struct GhostSuggestionLayout: Equatable {
             visibleFrame: visibleFrame
         )
 
-        // Direction-dependent anchor and budget.
-        // LTR: anchor at the right edge of the caret, budget extends rightward.
-        // RTL: anchor at the left edge of the caret, budget extends leftward.
-        let firstLineAnchor: CGFloat
+        // Anchor the ghost's first glyph exactly at the caret's insertion point so the suggestion
+        // occupies the pixels a typed glyph would — accepting or typing through it then produces no
+        // horizontal shift. The resolver builds every caret rect with its origin (`minX`) at the
+        // insertion point and a synthetic 2pt width extending rightward, so the insertion point is
+        // `caretRect.minX` in both writing directions (not `maxX`, which would sit a caret-width to
+        // the right). No gap is added: a gap is exactly the "slightly after the cursor" drift we want
+        // gone; any real word separation is already baked into the suggestion text itself.
+        // LTR: the anchor is the left edge; the budget extends rightward.
+        // RTL: the anchor is the right edge (panelFrame subtracts content width); budget extends left.
+        let caretInsertionX = geometry.caretRect.minX
+        let firstLineAnchor = min(max(caretInsertionX, usableFrame.minX), usableFrame.maxX)
         let firstLineBudget: CGFloat
         if isRTL {
-            firstLineAnchor = min(
-                max(geometry.caretRect.minX - Metrics.caretGap, usableFrame.minX),
-                usableFrame.maxX
-            )
             firstLineBudget = max(
                 0,
                 firstLineAnchor - usableFrame.minX - keycapReservation
             )
         } else {
-            firstLineAnchor = min(
-                max(geometry.caretRect.maxX + Metrics.caretGap, usableFrame.minX),
-                usableFrame.maxX
-            )
             firstLineBudget = max(
                 0,
                 usableFrame.maxX - firstLineAnchor - keycapReservation
@@ -107,6 +115,7 @@ struct GhostSuggestionLayout: Equatable {
                 ],
                 panelOriginX: firstLineAnchor,
                 lineHeight: lineHeight,
+                glyphBoxHeight: glyphBoxHeight,
                 topLineCenterOffsetFromCaret: 0,
                 isRightToLeft: isRTL
             )
@@ -173,15 +182,33 @@ struct GhostSuggestionLayout: Equatable {
             lines: finalLines,
             panelOriginX: panelOriginX,
             lineHeight: lineHeight,
+            glyphBoxHeight: glyphBoxHeight,
             topLineCenterOffsetFromCaret: startsBelowCaret ? -lineHeight : 0,
             isRightToLeft: isRTL
         )
     }
 
     func panelFrame(for contentSize: CGSize, caretRect: CGRect) -> CGRect {
-        let topLineCenterY = caretRect.midY + topLineCenterOffsetFromCaret
-        let originY = topLineCenterY - contentSize.height + (lineHeight / 2)
         let originX = isRightToLeft ? panelOriginX - contentSize.width : panelOriginX
+
+        let originY: CGFloat
+        if lines.count == 1 {
+            // Anchor the GLYPHS, not the panel box, to the caret line. Two upward biases made the
+            // ghost sit "a little too high" everywhere (the recurring field report):
+            //   • the old midpoint formula raised the panel by (caretHeight − contentHeight)/4
+            //     whenever the host line box was taller than the ghost row — i.e. in every editor
+            //     with generous line spacing;
+            //   • the row itself centers its glyphs, so they float (lineHeight − glyphBoxHeight)/2
+            //     above the row bottom.
+            // Compensating both places the ghost's glyph-box bottom on the caret rect's bottom —
+            // the line the host's own glyphs sit on.
+            originY = caretRect.minY - max(0, (lineHeight - glyphBoxHeight) / 2)
+        } else {
+            // Multi-line stacks from the caret's line downward using the layout's line height; the
+            // wrapped tail must keep flowing below, so the top-anchored math is retained here.
+            let topLineCenterY = caretRect.midY + topLineCenterOffsetFromCaret
+            originY = topLineCenterY - contentSize.height + (lineHeight / 2)
+        }
 
         return CGRect(
             origin: CGPoint(x: originX, y: originY),
@@ -214,15 +241,17 @@ struct GhostSuggestionLayout: Equatable {
             }
         }
 
-        // Fallback when no input frame is available. For LTR, use the area to the right
-        // of the caret. For RTL, use the area to the left.
+        // Fallback when no input frame is available. For LTR, use the area from the caret's insertion
+        // point (its left edge) rightward; for RTL, from the left margin up to the insertion point.
+        // Anchoring on `caretRect.minX` in both directions keeps the usable region flush with where a
+        // typed glyph would land, matching the gap-free first-line anchor above.
         let fallbackMinX: CGFloat
         let fallbackMaxX: CGFloat
         if geometry.isRightToLeft {
             fallbackMinX = visibleFrame.minX + Metrics.fallbackScreenMargin
-            fallbackMaxX = geometry.caretRect.minX - Metrics.caretGap
+            fallbackMaxX = geometry.caretRect.minX
         } else {
-            fallbackMinX = geometry.caretRect.maxX + Metrics.caretGap
+            fallbackMinX = geometry.caretRect.minX
             fallbackMaxX = visibleFrame.maxX - Metrics.fallbackScreenMargin
         }
 

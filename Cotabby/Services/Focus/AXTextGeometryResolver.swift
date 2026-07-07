@@ -110,10 +110,14 @@ struct AXTextGeometryResolver {
             }
         }
 
-        // Branch 1.5: Chromium / WebKit AXTextMarker fallback.
-        // Apps like Discord/Chrome fail NSRange queries but return a correct bounding box
-        // when we ask for the caret via their internal AXTextMarkerRange objects.
-        if let markerRect = AXHelper.textMarkerCaretRect(on: element), !markerRect.isEmpty {
+        // Branch 1.5: Chromium / WebKit / Electron AXTextMarker fallback.
+        // Apps like Discord/Chrome/Obsidian fail NSRange queries (or answer them with a garbage
+        // zero-size rect) but return the *correct* caret box through their internal AXTextMarkerRange
+        // objects. That box is legitimately zero-WIDTH — it is a caret, not a glyph — so it must be
+        // accepted on height alone; the previous `!isEmpty` guard rejected it (CGRect.isEmpty is true
+        // for zero width), which is exactly why Obsidian fell through to estimation despite exposing
+        // an exact caret.
+        if let markerRect = AXHelper.textMarkerCaretRect(on: element), Self.isUsableCaretRect(markerRect) {
             let cocoaRect = AXHelper.validatedCocoaTextRect(
                 fromAccessibilityRect: markerRect,
                 anchorFrame: cocoaAnchorFrame
@@ -772,6 +776,16 @@ struct AXTextGeometryResolver {
     ///
     /// Internal (not private) so tests can exercise the accept/reject boundary directly, without
     /// needing a live AX element that returns a controllable rect.
+    /// Whether a rect is a usable caret box. A caret is legitimately zero-WIDTH (an insertion point,
+    /// not a glyph), so — unlike `CGRect.isEmpty`, which is true for any zero dimension — usability
+    /// requires only finite components and a positive height. This is what lets the exact marker caret
+    /// (`width == 0`) be trusted instead of discarded as "empty".
+    static func isUsableCaretRect(_ rect: CGRect) -> Bool {
+        rect.origin.x.isFinite && rect.origin.y.isFinite
+            && rect.size.width.isFinite && rect.size.height.isFinite
+            && rect.size.height > 0
+    }
+
     func rectIsNearAnchor(_ cocoaRect: CGRect, anchor: CGRect?) -> Bool {
         guard let anchor, !anchor.isEmpty else {
             return true

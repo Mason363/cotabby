@@ -17,6 +17,14 @@ final class FocusDebugOverlayController {
         CotabbyDebugOptions.isEnabled
     }
 
+    /// Runtime show/hide state for the overlays, toggled from the menu bar and read live from
+    /// UserDefaults so it takes effect on the next focus/visual-context event without relaunching.
+    /// Default (key absent) is `false`, so the debug build starts with a clean screen and the
+    /// developer opts the overlays in when they want to inspect geometry.
+    private var overlaysVisible: Bool {
+        UserDefaults.standard.bool(forKey: CotabbyDebugOptions.overlaysVisibleDefaultsKey)
+    }
+
     private lazy var caretPanel: NSPanel = makePanel()
     private lazy var framePanel: NSPanel = makePanel()
     private lazy var bottomStatusPanel: NSPanel = makePanel(draggable: true)
@@ -33,7 +41,7 @@ final class FocusDebugOverlayController {
     private var latestPollEvent: FocusPollingEvent?
 
     func update(for snapshot: FocusSnapshot) {
-        guard let context = snapshot.context else {
+        guard overlaysVisible, let context = snapshot.context else {
             hideFocusGeometry()
             return
         }
@@ -179,7 +187,7 @@ final class FocusDebugOverlayController {
     }
 
     private var shouldShowBottomStatusPanel: Bool {
-        latestVisualContextStatus != .idle || latestPollEvent != nil
+        overlaysVisible && (latestVisualContextStatus != .idle || latestPollEvent != nil)
     }
 
     // MARK: - Helpers

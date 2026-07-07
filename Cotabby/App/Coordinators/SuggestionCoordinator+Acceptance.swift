@@ -303,7 +303,7 @@ extension SuggestionCoordinator {
             heldOverlayQuality = nil
         }
         if heldOverlayQuality != .layoutEstimated,
-           overlayController.advanceInline(to: remainingText, insertedText: insertionChunk) {
+           overlayController.advanceInline(to: remainingText) {
             return
         }
 
@@ -558,9 +558,9 @@ extension SuggestionCoordinator {
         }
 
         state = .ready(text: advancedSession.remainingText, latency: advancedSession.latency)
-        // Same slide as Tab acceptance; the user typed the next characters, so the caret traveled
-        // by exactly them. Fall back to the (session-start) caret anchor only if the slide can't apply.
-        if !overlayController.advanceInline(to: advancedSession.remainingText, insertedText: typedCharacters) {
+        // Same slide as Tab acceptance: consume the ghost's prefix and keep the remaining tail
+        // pixel-locked. Fall back to the (session-start) caret anchor only if the slide can't apply.
+        if !overlayController.advanceInline(to: advancedSession.remainingText) {
             presentOverlay(
                 text: advancedSession.remainingText,
                 at: session.baseContext.caretRect,
@@ -753,6 +753,7 @@ extension SuggestionCoordinator {
         context: FocusedInputContext,
         isRightToLeft: Bool = false,
         isCorrection: Bool = false,
+        replacedText: String? = nil,
         pendingInsertion: String = ""
     ) {
         let anchor = Self.layoutRepairedAnchor(
@@ -762,6 +763,15 @@ extension SuggestionCoordinator {
             isRightToLeft: isRightToLeft
         )
         logCaretLayoutRepair(anchor: anchor, fallbackRect: caretRect, context: context)
+        // When the caret was substituted by the layout estimate, reuse the size the estimator laid
+        // the text out with. It is a truer ghost size than re-deriving from the caret/line box, which
+        // over-sizes ghost text in editors with generous line spacing (Antinote-class fields).
+        let estimatedFontPointSize: CGFloat?
+        if anchor.quality == .layoutEstimated, case .estimate(let estimate)? = anchor.outcome {
+            estimatedFontPointSize = estimate.layoutFontPointSize
+        } else {
+            estimatedFontPointSize = nil
+        }
         let geometry = SuggestionOverlayGeometry(
             caretRect: anchor.rect,
             inputFrameRect: context.inputFrameRect,
@@ -772,7 +782,9 @@ extension SuggestionCoordinator {
             focusChangeSequence: context.focusChangeSequence,
             focusedInputIdentityKey: context.focusedInputIdentityKey,
             isCorrection: isCorrection,
-            resolvedFieldStyle: context.resolvedFieldStyle
+            replacedText: replacedText,
+            resolvedFieldStyle: context.resolvedFieldStyle,
+            estimatedFontPointSize: estimatedFontPointSize
         )
         if let message = overlayPresenter.present(
             text: text,

@@ -256,7 +256,15 @@ struct FocusSnapshotResolver {
         if resolvedCandidate.isSecure {
             resolvedFieldStyle = nil
         } else {
-            let styleKey = "\(application.processIdentifier):\(resolvedCandidate.elementIdentifier)"
+            // Include whether the field currently has text in the cache key. `resolveFieldStyle` reads
+            // the font from a character near the caret, so it can only return nil for an EMPTY field —
+            // and `FieldStyleCache` caches nil too. Without this bit, the nil resolved on first focus of
+            // an empty field would stick forever, so a field the user then types into never picks up its
+            // real font (Antinote exposes Menlo-14, yet the ghost stayed in the system font, over-sized
+            // and too high). Flipping the key when the first character arrives forces exactly one
+            // re-resolution that finds the font; further typing keeps the key stable.
+            let hasText = value.utf16.count > 0
+            let styleKey = "\(application.processIdentifier):\(resolvedCandidate.elementIdentifier):\(hasText)"
             resolvedFieldStyle = fieldStyleCache.style(forKey: styleKey) {
                 AXHelper.resolveFieldStyle(
                     for: resolvedCandidate.element,

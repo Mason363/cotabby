@@ -193,10 +193,14 @@ final class GhostSuggestionLayoutTests: XCTestCase {
 
         // Panel X should match panelOriginX
         XCTAssertEqual(frame.origin.x, layout.panelOriginX)
-        // Panel should be vertically centered around the caret midY
-        let expectedTopCenter = caretRect.midY + layout.topLineCenterOffsetFromCaret
-        let expectedY = expectedTopCenter - contentSize.height + (layout.lineHeight / 2)
+        // Single-line vertical anchors the GLYPH box bottom to the caret rect bottom: the panel
+        // drops below caretRect.minY by exactly the row's internal glyph inset, so the rendered
+        // glyphs (not the taller row box) sit on the host's text line.
+        let expectedY = caretRect.minY - max(0, (layout.lineHeight - layout.glyphBoxHeight) / 2)
         XCTAssertEqual(frame.origin.y, expectedY)
+        // Regression guard for the "a little too high" reports: the panel must never sit above the
+        // plain bottom-anchor, whatever the caret/row height ratio.
+        XCTAssertLessThanOrEqual(frame.origin.y, caretRect.minY)
     }
 
     // MARK: - Fallback to visible frame
@@ -262,8 +266,9 @@ final class GhostSuggestionLayoutTests: XCTestCase {
 
         // RTL: actual origin.x = panelOriginX - contentSize.width
         XCTAssertEqual(frame.origin.x, layout.panelOriginX - contentSize.width)
-        // Panel should be entirely to the left of the caret
-        XCTAssertLessThan(frame.maxX, geometry.caretRect.minX)
+        // The panel sits to the left of the caret, its right edge flush with the insertion point
+        // (caretRect.minX) — the gap-free "as if typed" anchor, so no strict inequality here.
+        XCTAssertLessThanOrEqual(frame.maxX, geometry.caretRect.minX)
     }
 
     // MARK: - RTL multi-line layout
@@ -336,8 +341,9 @@ final class GhostSuggestionLayoutTests: XCTestCase {
     // MARK: - Explicit newlines
 
     func test_make_explicitNewlineForcesLineBreakAtThatPoint() {
-        // usable frame: minX = max(0 + 8, 0 + 16) = 16; caret anchor = 12 + 6 = 18, so the first
-        // line is indented 2pt from the panel origin and the wrapped line starts at the origin.
+        // usable frame: minX = max(0 + 8, 0 + 16) = 16; caret anchor = max(caretRect.minX 10, 16) = 16
+        // (the caret's insertion point sits left of the field's content padding, so it clamps to the
+        // padding), so the first line sits at the panel origin (0pt indent) and the wrapped line too.
         let geometry = CotabbyTestFixtures.overlayGeometry(
             caretRect: CGRect(x: 10, y: 80, width: 2, height: 18),
             inputFrameRect: CGRect(x: 0, y: 70, width: 400, height: 30),
@@ -352,7 +358,7 @@ final class GhostSuggestionLayoutTests: XCTestCase {
         )
 
         XCTAssertEqual(layout.lines.map(\.text), ["hello", "world"])
-        XCTAssertEqual(layout.lines[0].leadingIndent, 2)
+        XCTAssertEqual(layout.lines[0].leadingIndent, 0)
         XCTAssertEqual(layout.lines[1].leadingIndent, 0)
         XCTAssertEqual(layout.topLineCenterOffsetFromCaret, 0)
         XCTAssertEqual(layout.panelOriginX, 16)
@@ -375,7 +381,7 @@ final class GhostSuggestionLayoutTests: XCTestCase {
         )
 
         XCTAssertEqual(layout.lines.map(\.text), ["world"])
-        XCTAssertEqual(layout.lines[0].leadingIndent, 2)
+        XCTAssertEqual(layout.lines[0].leadingIndent, 0)
         XCTAssertEqual(layout.topLineCenterOffsetFromCaret, 0)
     }
 
@@ -403,8 +409,8 @@ final class GhostSuggestionLayoutTests: XCTestCase {
     }
 
     func test_make_overwideSegmentBeforeNewlineWidthWrapsAndCarriesRemainder() {
-        // usable: minX 16, maxX 492; first-line budget = 492 - 18 - 36 (keycap) = 438; at 10pt per
-        // char the 60-char segment splits after 43 chars, and the leftover 17 chars must carry
+        // usable: minX 16, maxX 492; first-line budget = 492 - 16 - 36 (keycap) = 440; at 10pt per
+        // char the 60-char segment splits after 44 chars, and the leftover 16 chars must carry
         // forward together with the post-newline text as separate lines.
         let geometry = CotabbyTestFixtures.overlayGeometry(
             caretRect: CGRect(x: 10, y: 80, width: 2, height: 18),
@@ -421,9 +427,9 @@ final class GhostSuggestionLayoutTests: XCTestCase {
 
         XCTAssertEqual(
             layout.lines.map(\.text),
-            [String(repeating: "a", count: 43), String(repeating: "a", count: 17), "rest"]
+            [String(repeating: "a", count: 44), String(repeating: "a", count: 16), "rest"]
         )
-        XCTAssertEqual(layout.lines[0].leadingIndent, 2)
+        XCTAssertEqual(layout.lines[0].leadingIndent, 0)
         XCTAssertEqual(layout.topLineCenterOffsetFromCaret, 0)
         XCTAssertEqual(layout.lines.last?.showsKeycap, true)
     }
@@ -445,7 +451,7 @@ final class GhostSuggestionLayoutTests: XCTestCase {
         )
 
         XCTAssertEqual(layout.lines.map(\.text), ["W", "n", "e", "x", "t"])
-        XCTAssertEqual(layout.lines[0].leadingIndent, 2)
+        XCTAssertEqual(layout.lines[0].leadingIndent, 0)
     }
 
     func test_make_trailingNewlineAfterOverwideSegmentKeepsWidthWrappedRemainder() {
@@ -466,7 +472,7 @@ final class GhostSuggestionLayoutTests: XCTestCase {
 
         XCTAssertEqual(
             layout.lines.map(\.text),
-            [String(repeating: "a", count: 43), String(repeating: "a", count: 17)]
+            [String(repeating: "a", count: 44), String(repeating: "a", count: 16)]
         )
     }
 
@@ -487,10 +493,10 @@ final class GhostSuggestionLayoutTests: XCTestCase {
             visibleFrame: CGRect(x: 0, y: 0, width: 500, height: 300)
         )
 
-        // The fallback text frame runs from the screen margin to the caret gap, so the RTL anchor
-        // is exactly caret.minX - 6.
+        // The fallback text frame runs from the screen margin to the caret's insertion point, so the
+        // RTL anchor is exactly caret.minX (no gap).
         XCTAssertEqual(layout.lines.count, 1)
-        XCTAssertEqual(layout.panelOriginX, 294)
+        XCTAssertEqual(layout.panelOriginX, 300)
         XCTAssertEqual(layout.topLineCenterOffsetFromCaret, 0)
         XCTAssertTrue(layout.isRightToLeft)
     }

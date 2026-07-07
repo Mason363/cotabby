@@ -177,7 +177,13 @@ struct SuggestionConfiguration: Equatable, Sendable {
         topK: 20,
         topP: 0.7,
         minP: 0.08,
-        repetitionPenalty: 1.05,
+        // Repetition penalty is the only anti-repeat knob the llama sampler bridge exposes (there is
+        // no no-repeat-ngram or frequency penalty), so it carries the whole load. 1.05 was mild enough
+        // that Gemma still looped short function words and re-emitted the tail of the prefix ("the the",
+        // "and and", restating the last clause). 1.1 is the standard llama.cpp anti-repetition value:
+        // it visibly cuts the loops without starving legitimately repeated words like "to"/"the" the way
+        // a heavier 1.2+ would. Held constant so it never invalidates KV reuse.
+        repetitionPenalty: 1.1,
         randomSeed: nil,
         maxPrefixWords: 150,
         // The llama prefix window matches the Foundation Models one: the extra preceding sentences
@@ -199,7 +205,12 @@ struct SuggestionConfiguration: Equatable, Sendable {
         llamaPromptTokenBudget: SuggestionConfiguration.derivedLlamaPromptTokenBudget,
         // Seed the profile settings with lightweight defaults on first launch.
         defaultUserName: "Jacob",
-        defaultWordCountPreset: .twelveToTwenty,
+        // Short completions by default. On the base/llama path the length instruction is not obeyed,
+        // so the word range only moves the token budget — and 12-20 words meant Gemma generated ~20
+        // words per keystroke: slow, and long enough to drift off the user's intent. A 4-7 word phrase
+        // is fast to produce, easy to accept word-by-word, and far less prone to wandering; users who
+        // want longer runs can raise it in Settings.
+        defaultWordCountPreset: .fourToSeven,
         focusPollIntervalMilliseconds: 50
     )
 }
@@ -372,6 +383,11 @@ struct SuggestionRequest: Equatable, Sendable {
     /// string. `nil` when the user has not set it, distinguishing it from an empty-but-set value so
     /// renderers can skip the heading entirely.
     let extendedContext: String?
+    /// The on-device learned-profile line ("About the writer: …"), rendered by `UserMemoryStore` from
+    /// facts accumulated as the user types. `nil` when the feature is off or nothing is confident yet.
+    /// The llama prompt has already folded it in; this field exists so the Foundation Models renderer
+    /// can state the same facts in its own prompt shape.
+    let learnedProfile: String?
     /// Pre-rendered language hint built from the user's declared languages (e.g. "The user usually
     /// writes in German and English…"). `nil` when none are declared. Deliberately a hint, not an
     /// override: it tells the model to match the surrounding text and only fall back to the declared
@@ -411,6 +427,7 @@ struct SuggestionRequest: Equatable, Sendable {
         userName: String?,
         customRules: [String],
         extendedContext: String? = nil,
+        learnedProfile: String? = nil,
         languageInstruction: String?,
         clipboardContext: String?,
         visualContextSummary: String?,
@@ -434,6 +451,7 @@ struct SuggestionRequest: Equatable, Sendable {
         self.userName = userName
         self.customRules = customRules
         self.extendedContext = extendedContext
+        self.learnedProfile = learnedProfile
         self.languageInstruction = languageInstruction
         self.clipboardContext = clipboardContext
         self.visualContextSummary = visualContextSummary
@@ -634,9 +652,18 @@ struct SuggestionOverlayGeometry: Equatable, Sendable {
     /// `OverlayController` switches to a green tint on this signal so the user can tell at a glance
     /// that pressing the accept key will replace their last word, not extend it.
     let isCorrection: Bool
+    /// For a correction, the host text the accept will replace (the typo the user just finished).
+    /// The overlay strikes this through, left of the caret, so replacement reads unambiguously
+    /// instead of looking like the fix was appended. Nil for ordinary forward continuations.
+    let replacedText: String?
     /// The host field's own text font/color, so the overlay can render ghost text that matches the
     /// field instead of always using the system font and a fixed gray. Nil falls back to defaults.
     let resolvedFieldStyle: ResolvedFieldStyle?
+    /// The point size the text-layout estimator resolved and laid the caret out with, set only for
+    /// `.layoutEstimated` geometry. It is a far better ghost size than re-deriving from the caret/line
+    /// box, which over-sizes ghost text in editors that render with generous line spacing (the box is
+    /// much taller than the glyphs). Nil for every other quality, where sizing follows its own path.
+    let estimatedFontPointSize: CGFloat?
 
     init(
         caretRect: CGRect,
@@ -648,7 +675,9 @@ struct SuggestionOverlayGeometry: Equatable, Sendable {
         focusChangeSequence: UInt64 = 0,
         focusedInputIdentityKey: UInt64 = 0,
         isCorrection: Bool = false,
-        resolvedFieldStyle: ResolvedFieldStyle? = nil
+        replacedText: String? = nil,
+        resolvedFieldStyle: ResolvedFieldStyle? = nil,
+        estimatedFontPointSize: CGFloat? = nil
     ) {
         self.caretRect = caretRect
         self.inputFrameRect = inputFrameRect
@@ -659,7 +688,9 @@ struct SuggestionOverlayGeometry: Equatable, Sendable {
         self.focusChangeSequence = focusChangeSequence
         self.focusedInputIdentityKey = focusedInputIdentityKey
         self.isCorrection = isCorrection
+        self.replacedText = replacedText
         self.resolvedFieldStyle = resolvedFieldStyle
+        self.estimatedFontPointSize = estimatedFontPointSize
     }
 
     /// Returns a copy with only `caretRect` replaced. Used to advance the ghost by an exact measured
@@ -674,7 +705,10 @@ struct SuggestionOverlayGeometry: Equatable, Sendable {
             isRightToLeft: isRightToLeft,
             focusChangeSequence: focusChangeSequence,
             focusedInputIdentityKey: focusedInputIdentityKey,
-            resolvedFieldStyle: resolvedFieldStyle
+            isCorrection: isCorrection,
+            replacedText: replacedText,
+            resolvedFieldStyle: resolvedFieldStyle,
+            estimatedFontPointSize: estimatedFontPointSize
         )
     }
 }

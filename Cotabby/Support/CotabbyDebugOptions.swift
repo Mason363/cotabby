@@ -16,6 +16,16 @@ nonisolated enum CotabbyDebugOptions {
         ProcessInfo.processInfo.arguments.contains(launchArgument)
     }
 
+    /// UserDefaults key backing the runtime show/hide toggle for the on-screen debug overlays
+    /// (caret badge, input-frame outline, and the visual-context status HUD).
+    ///
+    /// This is distinct from `-cotabby-debug`: the launch argument decides whether the debug
+    /// controller exists at all (and enables verbose logging / capture); this flag decides whether
+    /// its panels are currently painted. That split lets a developer running the debug build hide the
+    /// overlays to type against a clean screen and flip them back on from the menu bar without
+    /// relaunching. Absent (the default) reads as `false`, so overlays start hidden.
+    static let overlaysVisibleDefaultsKey = "cotabbyDebugOverlaysVisible"
+
     /// The swift-log floor applied to the always-on `OSLogHandler` and the debug-only file sinks.
     ///
     /// swift-log only skips evaluating a log call's `@autoclosure` message (and building its

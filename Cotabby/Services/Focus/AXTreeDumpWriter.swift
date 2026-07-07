@@ -4,20 +4,21 @@ import Logging
 
 /// File overview:
 /// Renders the focused AX element plus its ancestors and children to plain text and overwrites
-/// `~/Desktop/cotabby-ax-dump.txt`. This is a developer diagnostic for triaging caret-placement and
-/// host-AX-publish issues (primarily Chrome contenteditables), kept out of `FocusSnapshotResolver`
-/// so that hot path stays focused on snapshot assembly rather than diagnostic disk I/O.
+/// `~/Desktop/cotabby-ax-dump.txt`, and — the point of this file — a **ground-truth probe** of the
+/// focused element: the exact parameterized attributes it advertises and the live results of every
+/// exact-geometry/font API Cotabby relies on (`AXBoundsForRange`, `AXBoundsForTextMarkerRange`,
+/// `AXAttributedStringForRange`). This is how we tell, per app, whether an exact caret/font path is
+/// available and merely being skipped versus genuinely unavailable — so resolution is fixed by fact,
+/// not guesswork. Kept out of `FocusSnapshotResolver` so that hot path stays focused on snapshot
+/// assembly rather than diagnostic disk I/O.
 ///
-/// The dump only runs on debug builds (`-cotabby-debug`), only for the configured bundle, and is
-/// debounced to one write per focused-element identity change so rapid focus/value notifications
-/// inside one field don't overwrite the file mid-inspection. Writes are best-effort.
+/// The dump only runs on debug builds (`-cotabby-debug`) and is debounced to one write per
+/// focused-element identity change so rapid focus/value notifications inside one field don't
+/// overwrite the file mid-inspection. It runs for whatever app is focused (not one hard-coded
+/// bundle), so focusing a field in any app — Antinote, Obsidian, Notes — captures that app's
+/// ground truth at the stable path. Writes are best-effort.
 @MainActor
 enum AXTreeDumpWriter {
-    /// Bundle identifier we automatically dump the AX tree for when `-cotabby-debug` is on.
-    /// Chrome's contenteditable surfaces are the source of most caret-placement and host-AX-publish
-    /// reports, so the dump exists primarily for triaging those — extend the gate (or replace the
-    /// constant) once another bundle needs the same treatment.
-    private static let dumpAXBundleIdentifier = "com.google.Chrome"
     /// Last focused-element identifier we wrote to disk. The dump only runs when this changes, so
     /// rapid focus events inside the same field don't repeatedly overwrite the file mid-inspection.
     private static var lastDumpedElementID: String?
@@ -27,9 +28,9 @@ enum AXTreeDumpWriter {
         return formatter
     }()
 
-    /// Writes the AX tree dump for `focusedElement`, but only on debug builds, only for the configured
-    /// bundle (currently Chrome), and only when the focused element changed since the last dump
-    /// (debounced by element identity). A no-op otherwise.
+    /// Writes the AX tree dump + focused-element probe for `focusedElement`, but only on debug builds
+    /// and only when the focused element changed since the last dump (debounced by element identity).
+    /// A no-op otherwise. Runs for any app so focusing a field captures that app's ground truth.
     static func dumpIfEnabled(
         focusedElement: AXUIElement,
         applicationName: String,
@@ -37,7 +38,6 @@ enum AXTreeDumpWriter {
         focusedElementIdentifier: String
     ) {
         guard CotabbyDebugOptions.isEnabled,
-              bundleIdentifier == dumpAXBundleIdentifier,
               lastDumpedElementID != focusedElementIdentifier else {
             return
         }
@@ -76,6 +76,9 @@ enum AXTreeDumpWriter {
 
         out += "\n-- Children (depth 6) --\n"
         dumpChildrenRecursive(of: focusedElement, into: &out, indent: "", depth: 0)
+
+        out += "\n-- Focused element probe (exact-data ground truth) --\n"
+        out += focusedElementProbe(focusedElement)
 
         out += "========== END DUMP ==========\n"
 
@@ -171,6 +174,102 @@ enum AXTreeDumpWriter {
         if childCount > 0 { summary += "\(indent)  children: \(childCount)\n" }
 
         return summary
+    }
+
+    /// Deep, exact-data probe of the focused element itself: the parameterized attributes it
+    /// advertises and the live results of every exact-geometry/font API the resolver relies on. This
+    /// is the ground truth that distinguishes "an exact path is available and being skipped" from
+    /// "the datum is genuinely absent", so caret/font resolution is fixed per app by fact, not guess.
+    private static func focusedElementProbe(_ element: AXUIElement) -> String {
+        var out = ""
+        let attrs = AXHelper.attributeNames(on: element).sorted()
+        let paramAttrs = Set(AXHelper.parameterizedAttributeNames(on: element))
+        out += "attributes: \(attrs.joined(separator: ", "))\n"
+        out += "parameterized: \(paramAttrs.sorted().joined(separator: ", "))\n"
+
+        let axFrame = AXHelper.rectValue(for: "AXFrame" as CFString, on: element)
+        let anchor = axFrame.map(AXHelper.cocoaRect(fromAccessibilityRect:))
+        if let axFrame, let anchor {
+            out += "AXFrame: \(fmt(axFrame))  cocoa: \(fmt(anchor))\n"
+        }
+
+        let value = AXHelper.stringValue(for: kAXValueAttribute as CFString, on: element)
+        let valueLength = (value as NSString?)?.length ?? 0
+        out += "value length: \(valueLength)\n"
+
+        // Selection: native NSRange (document offset) vs the marker-synthesized (window-relative) one.
+        let nativeSelection = AXHelper.rangeValue(for: kAXSelectedTextRangeAttribute as CFString, on: element)
+        let markerSelection = AXHelper.synthesizeMarkerSelection(on: element, parameterizedAttributes: paramAttrs)
+        if let nativeSelection {
+            out += "native selection: loc=\(nativeSelection.location) len=\(nativeSelection.length)\n"
+        } else {
+            out += "native selection: none\n"
+        }
+        if let markerSelection {
+            let windowLen = (markerSelection.text as NSString).length
+            out += "marker selection: caretOffset=\(markerSelection.selection.location) windowLen=\(windowLen)\n"
+        } else {
+            out += "marker selection: none\n"
+        }
+
+        // Exact caret geometry candidates. NSRange BoundsForRange only makes sense at a real document
+        // offset, so it is tried only when a native selection exists.
+        if let caretLocation = nativeSelection?.location {
+            probeBoundsForRange(
+                element, label: "BoundsForRange(caret,0)",
+                range: NSRange(location: caretLocation, length: 0), anchor: anchor, into: &out)
+            if caretLocation > 0 {
+                probeBoundsForRange(
+                    element, label: "BoundsForRange(caret-1,1)",
+                    range: NSRange(location: caretLocation - 1, length: 1), anchor: anchor, into: &out)
+            }
+        } else {
+            out += "BoundsForRange: skipped (no native selection; an NSRange offset would be window-relative)\n"
+        }
+
+        if let markerRect = AXHelper.textMarkerCaretRect(on: element) {
+            let cocoa = AXHelper.validatedCocoaTextRect(fromAccessibilityRect: markerRect, anchorFrame: anchor)
+            out += "textMarkerCaret: raw \(fmt(markerRect))  cocoa \(fmt(cocoa))  empty=\(markerRect.isEmpty)\n"
+        } else {
+            out += "textMarkerCaret: nil\n"
+        }
+
+        // Exact font/color via AXAttributedStringForRange.
+        let fontCaret = nativeSelection?.location ?? markerSelection?.selection.location ?? 0
+        let textLength = max(valueLength, (markerSelection?.text as NSString?)?.length ?? 0)
+        if let style = AXHelper.resolveFieldStyle(for: element, caretLocation: fontCaret, textLength: textLength) {
+            let size = style.fontPointSize.map { String(format: "%.1f", $0) } ?? "nil"
+            out += "fieldStyle: font=\(style.fontName ?? "nil") size=\(size) color=\(style.colorHex ?? "nil")\n"
+        } else {
+            out += "fieldStyle: nil (no AXAttributedStringForRange font exposed)\n"
+        }
+        return out
+    }
+
+    /// Reports one `AXBoundsForRange` probe: raw rect, its Cocoa conversion, and whether that Cocoa
+    /// rect passes the same 80pt anchor halo the resolver uses to accept/reject a bounds result.
+    private static func probeBoundsForRange(
+        _ element: AXUIElement,
+        label: String,
+        range: NSRange,
+        anchor: CGRect?,
+        into out: inout String
+    ) {
+        guard let raw = AXHelper.parameterizedRectValue(
+            for: kAXBoundsForRangeParameterizedAttribute as CFString, range: range, on: element
+        ) else {
+            out += "\(label): FAILED\n"
+            return
+        }
+        let cocoa = AXHelper.validatedCocoaTextRect(fromAccessibilityRect: raw, anchorFrame: anchor)
+        let nearAnchor: String
+        if let anchor, !anchor.isEmpty {
+            let expanded = anchor.insetBy(dx: -80, dy: -80)
+            nearAnchor = expanded.contains(CGPoint(x: cocoa.midX, y: cocoa.midY)) ? "nearAnchor=YES" : "nearAnchor=NO"
+        } else {
+            nearAnchor = "nearAnchor=?"
+        }
+        out += "\(label): raw \(fmt(raw))  cocoa \(fmt(cocoa))  \(nearAnchor)\n"
     }
 
     private static func fmt(_ rect: CGRect) -> String {

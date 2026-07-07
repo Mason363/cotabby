@@ -147,6 +147,30 @@ final class AXTextGeometryResolverTests: XCTestCase {
         XCTAssertTrue(resolver.rectIsNearAnchor(rect, anchor: .zero))
     }
 
+    // MARK: - isUsableCaretRect (accepts zero-WIDTH carets from the text-marker path)
+
+    func test_isUsableCaretRect_acceptsZeroWidthCaret() {
+        // The exact caret from AXBoundsForTextMarkerRange is zero-width (an insertion point, not a
+        // glyph). It must be accepted — this is the Obsidian/Electron fix. `CGRect.isEmpty` would
+        // reject it because width == 0.
+        let markerCaret = CGRect(x: 684, y: 219, width: 0, height: 20)
+        XCTAssertTrue(markerCaret.isEmpty, "precondition: a caret rect looks 'empty' to CGRect")
+        XCTAssertTrue(AXTextGeometryResolver.isUsableCaretRect(markerCaret))
+    }
+
+    func test_isUsableCaretRect_rejectsZeroHeightAndNonFinite() {
+        XCTAssertFalse(AXTextGeometryResolver.isUsableCaretRect(CGRect(x: 0, y: 0, width: 0, height: 0)))
+        XCTAssertFalse(AXTextGeometryResolver.isUsableCaretRect(CGRect(x: 10, y: 10, width: 2, height: 0)))
+        XCTAssertFalse(AXTextGeometryResolver.isUsableCaretRect(
+            CGRect(x: CGFloat.nan, y: 0, width: 0, height: 20)))
+        XCTAssertFalse(AXTextGeometryResolver.isUsableCaretRect(
+            CGRect(x: 0, y: 0, width: 0, height: CGFloat.infinity)))
+    }
+
+    func test_isUsableCaretRect_acceptsNormalGlyphRect() {
+        XCTAssertTrue(AXTextGeometryResolver.isUsableCaretRect(CGRect(x: 10, y: 10, width: 8, height: 20)))
+    }
+
     // MARK: - Non-finite AX rect rejection (crash guard)
 
     func test_rectHasFiniteComponents_rejectsNaNAndInfinity() {

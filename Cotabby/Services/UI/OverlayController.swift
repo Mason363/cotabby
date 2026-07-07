@@ -13,9 +13,17 @@ import SwiftUI
 @MainActor
 final class OverlayController: SuggestionOverlayControlling {
     private enum Layout {
-        static let minimumGhostFontSize: CGFloat = 14
+        /// Floor for the caret-height *approximation* path only. Lowered from 14 to 11 so auto-sized
+        /// ghost text can match dense body fields (~11-13pt) instead of always rendering at least 14pt
+        /// and reading as a larger, different font. `GhostFontMetrics.absoluteMinimumPointSize` (9pt)
+        /// remains the hard legibility backstop below this. The trusted reported-size path bypasses
+        /// this floor entirely and renders at the host's real size.
+        static let minimumGhostFontSize: CGFloat = 11
         static let maximumGhostFontSize: CGFloat = 24
         static let maximumEstimatedGhostFontSize: CGFloat = 16
+        /// Cap for the trusted reported-size path. Generous (headings render near their real size)
+        /// while still guarding against an absurd host-reported value bloating the overlay.
+        static let maximumTrustedGhostFontSize: CGFloat = 48
         static let fontToLineHeightRatio: CGFloat = 0.78
     }
 
@@ -55,6 +63,9 @@ final class OverlayController: SuggestionOverlayControlling {
     /// defeat SwiftUI's type-aware diffing.
     private var inlineHostingView: NSHostingView<GhostSuggestionView>?
     private var mirrorHostingView: NSHostingView<MirrorOverlayView>?
+
+    /// Hosting view for the correction strikethrough drawn over the typo, reused across updates.
+    private var strikeHostingView: NSHostingView<CorrectionStrikeView>?
 
     /// Per-focus-session floor for caret-derived font size. Caret height flickers between the real
     /// line height and the coarse field-height fallback from poll to poll; stabilizing keeps ghost
@@ -97,6 +108,28 @@ final class OverlayController: SuggestionOverlayControlling {
         return panel
     }()
 
+    /// Separate non-activating panel that strikes through the host's typo when an inline correction
+    /// is shown. Kept apart from the ghost `panel` (which anchors right of the caret) because the
+    /// strike sits left of the caret; a second panel avoids reworking the ghost's caret-anchored
+    /// layout math to span both sides.
+    private lazy var strikePanel: OverlayPanel = {
+        let panel = OverlayPanel(
+            contentRect: CGRect(x: 0, y: 0, width: 10, height: 10),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: true
+        )
+        panel.isReleasedWhenClosed = false
+        panel.backgroundColor = .clear
+        panel.isOpaque = false
+        panel.ignoresMouseEvents = true
+        panel.hasShadow = false
+        panel.animationBehavior = .none
+        panel.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        return panel
+    }()
+
     /// Sizes and positions the overlay using the render mode the policy picks for this geometry.
     /// Each mode is responsible for its own layout math and SwiftUI view; this entry point just
     /// routes and records the resulting state.
@@ -104,6 +137,24 @@ final class OverlayController: SuggestionOverlayControlling {
         guard !text.isEmpty else {
             hide(reason: "Overlay not shown because the suggestion was empty.")
             return
+        }
+
+        // Per-app render-mode overrides are not wired yet, so the policy always resolves without a
+        // host bundle identifier; thread the focused app's id here when per-app overrides ship.
+        let policyMode = currentRenderModePolicy.mode(
+            for: geometry,
+            bundleIdentifier: nil
+        )
+
+        // Resolve what to actually do before rendering. A transient caret-quality dip while we are
+        // stably inline must not flip us to the field-anchored card (the "teleport"): hold the
+        // current inline overlay untouched when nothing but caret quality changed, otherwise render.
+        let mode: CompletionRenderMode
+        switch resolvePresentation(policyMode: policyMode, geometry: geometry, text: text) {
+        case .holdInline:
+            return
+        case .render(let resolved):
+            mode = resolved
         }
 
         // Decide on the fade using the panel state captured *before* `state` is reassigned below, so
@@ -116,13 +167,6 @@ final class OverlayController: SuggestionOverlayControlling {
             isEnabled: suggestionSettings.fadeInSuggestions,
             overlayWasVisible: state.isVisible,
             reduceMotionEnabled: reduceMotionEnabled
-        )
-
-        // Per-app render-mode overrides are not wired yet, so the policy always resolves without a
-        // host bundle identifier; thread the focused app's id here when per-app overrides ship.
-        let mode = currentRenderModePolicy.mode(
-            for: geometry,
-            bundleIdentifier: nil
         )
 
         // Start fully transparent so the panel's first composited frame is invisible. Setting alpha
@@ -149,9 +193,55 @@ final class OverlayController: SuggestionOverlayControlling {
         }
     }
 
+    /// What `showSuggestion` should do this call once caret-quality hysteresis is applied.
+    private enum PresentationResolution {
+        /// Render the ghost in this mode (the normal path).
+        case render(CompletionRenderMode)
+        /// Leave the current inline overlay exactly as drawn — a transient caret-quality dip that is
+        /// not worth touching the panel for, and must never flip us to the card.
+        case holdInline
+    }
+
+    /// Suppresses the inline→card flip (and needless re-anchors) when the caret quality only dipped
+    /// transiently.
+    ///
+    /// Fast typing and deleting momentarily fail the precise AX caret query, so a poll or two reports
+    /// `.estimated`/`.layoutEstimated` before the exact caret returns. The render policy promotes those
+    /// qualities to the card, which anchors to the *field rectangle* rather than the caret — so on
+    /// those frames the suggestion visibly "teleports" to the bottom of the field and snaps back a
+    /// frame later. That flip/flap is the teleporting and flashing users report.
+    ///
+    /// While we are already showing an inline ghost in the same focus session, a quality-only promotion
+    /// never flips us to the card. If nothing but caret quality changed (same tail — the common
+    /// re-anchor tick mid-typing) we `holdInline`, leaving the panel untouched so it does not even
+    /// jitter to a lower-confidence caret. If the tail changed we re-render `.inline` at the fresh
+    /// caret, which even when estimated tracks the cursor far closer than the field-anchored card.
+    ///
+    /// We deliberately do NOT override the other promotions: a mid-line caret (`.caretMidLine`) cannot
+    /// render inline without painting over the user's trailing text, and a `.userPreference` /
+    /// `.perAppOverride` "Popup" choice is intentional. A first present into an estimated field (state
+    /// hidden, or a different focus session) also still routes to the card, so a truly low-quality host
+    /// starts — and stays — on the card rather than being forced inline against bad geometry.
+    private func resolvePresentation(
+        policyMode: CompletionRenderMode,
+        geometry: SuggestionOverlayGeometry,
+        text: String
+    ) -> PresentationResolution {
+        guard case .mirror(let reason) = policyMode,
+              reason == .caretGeometryEstimated || reason == .caretLayoutEstimated,
+              geometry.isCaretAtEndOfLine,
+              case let .visible(currentText, currentGeometry, .inline) = state,
+              currentGeometry.focusChangeSequence == geometry.focusChangeSequence
+        else {
+            return .render(policyMode)
+        }
+        return currentText == text ? .holdInline : .render(.inline)
+    }
+
     /// Hides the floating panel and records why the overlay is no longer visible.
     func hide(reason: String) {
         panel.orderOut(nil)
+        strikePanel.orderOut(nil)
         state = .hidden(reason: reason)
     }
 
@@ -201,7 +291,9 @@ final class OverlayController: SuggestionOverlayControlling {
         let fontSize = resolvedGhostFontSize(
             forCaretHeight: stabilizedCaretHeight,
             caretQuality: geometry.caretQuality,
-            fieldFont: referenceFieldFont
+            fieldFont: referenceFieldFont,
+            reportedPointSize: geometry.resolvedFieldStyle?.fontPointSize,
+            estimatedPointSize: geometry.estimatedFontPointSize
         )
         // Render in the field's typeface at the derived size so the ghost reads as a continuation of
         // the host text rather than pasted-on system font. Nil falls back to the system font.
@@ -269,15 +361,63 @@ final class OverlayController: SuggestionOverlayControlling {
         // panel by the prefix width measured in the same typeface and size.
         lastInlineFontSize = fontSize
         lastInlineRenderFont = renderFont
+
+        updateCorrectionStrike(
+            geometry: geometry,
+            renderFont: renderFont ?? NSFont.systemFont(ofSize: fontSize),
+            fontSize: fontSize
+        )
+    }
+
+    /// Draws a strikethrough over the word an inline correction will replace, or hides it when the
+    /// current presentation is not an inline correction. The typo ends at the caret's insertion
+    /// point (`caretRect.minX`) and its width is measured in the same font the ghost renders in, so
+    /// the line spans exactly the host glyphs it crosses out: `[caretRect.minX - typoWidth, minX]`.
+    private func updateCorrectionStrike(
+        geometry: SuggestionOverlayGeometry,
+        renderFont: NSFont,
+        fontSize: CGFloat
+    ) {
+        guard geometry.isCorrection,
+              let replaced = geometry.replacedText,
+              !replaced.isEmpty
+        else {
+            strikePanel.orderOut(nil)
+            return
+        }
+
+        let typoWidth = GhostSuggestionLayout.renderedWidth(of: replaced, font: renderFont)
+        let frame = CGRect(
+            x: geometry.caretRect.minX - typoWidth,
+            y: geometry.caretRect.minY,
+            width: typoWidth,
+            height: geometry.caretRect.height
+        )
+        guard typoWidth > 0, AXHelper.rectHasFiniteComponents(frame) else {
+            strikePanel.orderOut(nil)
+            return
+        }
+
+        let rootView = CorrectionStrikeView(fontSize: fontSize)
+        if let existing = strikeHostingView {
+            existing.rootView = rootView
+        } else {
+            let fresh = NSHostingView(rootView: rootView)
+            strikeHostingView = fresh
+            strikePanel.contentView = fresh
+        }
+
+        strikePanel.setFrame(frame.integral, display: true)
+        strikePanel.orderFrontRegardless()
     }
 
     /// Advances a visible single-line inline ghost to `remainingText` by sliding the panel right by
-    /// the caret's travel for `insertedText`. This is the "perfectly still" path for word-by-word
-    /// acceptance and type-through: it reads the held overlay state (not a fresh AX caret), so it
-    /// cannot jitter against AX noise.
+    /// the width the consumed prefix occupied in the ghost's own render font. This is the "perfectly
+    /// still" path for word-by-word acceptance and type-through: it reads the held overlay state (not
+    /// a fresh AX caret), so it cannot jitter against AX noise.
     /// Returns `false` when the held overlay is not a single-line, LTR, inline ghost this can safely
     /// slide; the caller then falls back to a caret-anchored present.
-    func advanceInline(to remainingText: String, insertedText: String) -> Bool {
+    func advanceInline(to remainingText: String) -> Bool {
         guard case let .visible(beforeText, geometry, mode) = state,
               case .inline = mode,
               !geometry.isRightToLeft,
@@ -289,28 +429,18 @@ final class OverlayController: SuggestionOverlayControlling {
         }
 
         let renderFont = lastInlineRenderFont ?? NSFont.systemFont(ofSize: fontSize)
-        // Trusted-geometry hosts get the slide measured in the field's own font: that is the
-        // caret's true travel, so the anchor stays aligned with the post-publish AX caret and the
-        // stability gate never has to issue a delayed corrective nudge. The ghost render font is
-        // floored at 14pt for legibility, so its width of the same text overshoots a 12pt host by
-        // ~15% per accepted word; that error used to accumulate in the anchor until the gate
-        // snapped the tail sideways with no input in flight. The cost is a few points of tail
-        // shift at the accept keystroke itself (the ghost glyphs are wider than the host's), which
-        // lands exactly when the text visibly changes anyway. Untrusted/web geometry keeps the
-        // pixel-identical ghost-width slide: its anchors are approximate either way, and observed
-        // char-width hosts already correct through their own machinery.
-        let shift: CGFloat
-        if geometry.caretQuality == .exact || geometry.caretQuality == .derived,
-           let hostAdvance = InsertedTextAdvance.width(
-               of: insertedText,
-               observedCharWidth: geometry.observedCharWidth,
-               style: geometry.resolvedFieldStyle
-           ) {
-            shift = hostAdvance
-        } else {
-            shift = GhostSuggestionLayout.renderedWidth(of: beforeText, font: renderFont)
-                - GhostSuggestionLayout.renderedWidth(of: remainingText, font: renderFont)
-        }
+        // Slide by the width the consumed text occupied in the ghost's own render font — its exact
+        // glyphs, not the host's average character width. This keeps the remaining tail pixel-locked
+        // as the user types or accepts through it: a typed space consumes exactly the ghost's space,
+        // so the rest of the suggestion never shifts. The previous path measured the inserted text via
+        // the host's average char width (`observedCharWidth`), which is far wider than a space and
+        // nudged the tail on every space typed. Because the ghost now renders in the host's font at
+        // the host's real point size on trusted geometry (see `resolvedGhostFontSize`), this width
+        // also equals the host caret's true travel there, so the anchor stays aligned with the
+        // post-publish AX caret and the stability gate has nothing to correct. On untrusted geometry
+        // the anchor is approximate regardless; keeping the ghost visually stable is the better trade.
+        let shift = GhostSuggestionLayout.renderedWidth(of: beforeText, font: renderFont)
+            - GhostSuggestionLayout.renderedWidth(of: remainingText, font: renderFont)
         // A non-positive or non-finite shift means the tail did not shrink as expected; re-anchor.
         guard shift.isFinite, shift > 0 else {
             return false
@@ -407,6 +537,9 @@ final class OverlayController: SuggestionOverlayControlling {
         }
         panel.setFrame(panelFrame, display: true)
         panel.orderFrontRegardless()
+        // The card anchors to the field rect, not the caret, so there is no trustworthy typo
+        // rectangle to strike here; keep the strikethrough an inline-only affordance.
+        strikePanel.orderOut(nil)
     }
 
     /// Exact and derived caret rects usually reflect the real text line height, so they may scale
@@ -417,11 +550,34 @@ final class OverlayController: SuggestionOverlayControlling {
     private func resolvedGhostFontSize(
         forCaretHeight caretHeight: CGFloat,
         caretQuality: CaretGeometryQuality,
-        fieldFont: NSFont?
+        fieldFont: NSFont?,
+        reportedPointSize: CGFloat?,
+        estimatedPointSize: CGFloat?
     ) -> CGFloat {
-        let qualityCap = caretQuality == .estimated
-            ? Layout.maximumEstimatedGhostFontSize
-            : Layout.maximumGhostFontSize
+        // The ghost's SIZE and the caret's POSITION quality are orthogonal: an estimated caret does
+        // not make the host's declared 13pt font any less 13pt. Deriving size from the caret/line box
+        // instead over-sizes ghost text in fields that render with generous line spacing — the box is
+        // far taller than the glyphs — which is the "ghost is too big" report in editors like
+        // Antinote. So trust a known point size for sizing whenever we have one:
+        //   • the host's own reported size (any position quality — it's a direct AX fact), else
+        //   • for a layout-estimated caret, the size the estimator already resolved and laid out with.
+        // Only when the host reveals no size at all do we fall back to caret-height derivation.
+        let trustedPointSize: CGFloat? = {
+            if let reportedPointSize, reportedPointSize > 0 { return reportedPointSize }
+            if caretQuality == .layoutEstimated, let estimatedPointSize, estimatedPointSize > 0 {
+                return estimatedPointSize
+            }
+            return nil
+        }()
+
+        let qualityCap: CGFloat
+        if trustedPointSize != nil {
+            qualityCap = Layout.maximumTrustedGhostFontSize
+        } else if caretQuality == .estimated {
+            qualityCap = Layout.maximumEstimatedGhostFontSize
+        } else {
+            qualityCap = Layout.maximumGhostFontSize
+        }
 
         let fieldMetrics = fieldFont.map {
             GhostFontMetrics.FieldFontMetrics(
@@ -437,13 +593,15 @@ final class OverlayController: SuggestionOverlayControlling {
             fallbackRatio: Layout.fontToLineHeightRatio,
             minimum: Layout.minimumGhostFontSize,
             maximum: qualityCap,
-            sizeMultiplier: CGFloat(suggestionSettings.ghostTextSizeMultiplier)
+            sizeMultiplier: CGFloat(suggestionSettings.ghostTextSizeMultiplier),
+            trustedPointSize: trustedPointSize
         )
     }
 
     /// Builds the host field's `NSFont` from a resolved style, or nil when the name is missing or the
-    /// font cannot be instantiated. The size is only a reference for metric extraction; the rendered
-    /// size is derived from caret height in `resolvedGhostFontSize`.
+    /// font cannot be instantiated. The size here is only a reference for glyph-box metric extraction;
+    /// the rendered size comes from `resolvedGhostFontSize`, which prefers the host's reported point
+    /// size when the caret geometry is trustworthy and otherwise derives it from caret height.
     private func fieldFont(from style: ResolvedFieldStyle) -> NSFont? {
         guard let name = style.fontName else { return nil }
         return NSFont(name: name, size: style.fontPointSize ?? Layout.minimumGhostFontSize)
@@ -499,6 +657,21 @@ private enum SuggestionCorrectionStyle {
         colorScheme == .dark
             ? Color(red: 0.45, green: 0.85, blue: 0.45)
             : Color(red: 0.15, green: 0.60, blue: 0.20)
+    }
+}
+
+/// A single horizontal strikethrough line, in the correction green, hosted in a panel sized to the
+/// typo's rect. A thin rounded bar centered vertically reads as a deliberate cross-out (not an
+/// underline); the thickness scales with the ghost size so it stays proportional across fields.
+private struct CorrectionStrikeView: View {
+    @Environment(\.colorScheme) var colorScheme
+    let fontSize: CGFloat
+
+    var body: some View {
+        Capsule()
+            .fill(SuggestionCorrectionStyle.color(for: colorScheme))
+            .frame(height: max(1, (fontSize * 0.09).rounded()))
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
     }
 }
 
