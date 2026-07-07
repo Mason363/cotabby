@@ -559,12 +559,32 @@ extension SuggestionCoordinator {
 
         state = .ready(text: advancedSession.remainingText, latency: advancedSession.latency)
         // Same slide as Tab acceptance: consume the ghost's prefix and keep the remaining tail
-        // pixel-locked. Fall back to the (session-start) caret anchor only if the slide can't apply.
+        // pixel-locked. When the slide can't apply (e.g. either layout wraps near the field edge),
+        // anchor at the session-start caret advanced past everything consumed so far — NOT the raw
+        // session-start caret. The raw anchor is stale by every typed-through character, so this
+        // path and the focus-poll re-anchor (which uses the live caret) alternated between two
+        // carets ~50pt apart, flipping the layout between one and two lines twice per keystroke:
+        // the measured Antinote "teleport" (panel ping-ponging 230pt left and one line up at
+        // 2026-07-07T17:50:25.9 in the overlay-present telemetry). Predicting the consumed advance
+        // keeps both paths anchored at the same caret, so the layouts agree and nothing flips.
         if !overlayController.advanceInline(to: advancedSession.remainingText) {
+            let isRTL = TextDirectionDetector.isRightToLeft(session.baseContext.precedingText)
+            let predictedCaret = Self.predictedCaretRect(
+                after: advancedSession.acceptedText,
+                oldCaretRect: session.baseContext.caretRect,
+                caretQuality: session.baseContext.caretQuality,
+                observedCharWidth: session.baseContext.observedCharWidth,
+                fieldStyle: session.baseContext.resolvedFieldStyle,
+                isRightToLeft: isRTL
+            )
             presentOverlay(
                 text: advancedSession.remainingText,
-                at: session.baseContext.caretRect,
-                context: session.baseContext
+                at: predictedCaret,
+                context: session.baseContext,
+                isRightToLeft: isRTL,
+                // The layout repair models the caret from the prefix text; the consumed tail is
+                // exactly what the host has published beyond the session-start prefix.
+                pendingInsertion: advancedSession.acceptedText
             )
         }
         logStage(
