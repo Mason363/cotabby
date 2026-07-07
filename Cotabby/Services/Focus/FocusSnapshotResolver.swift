@@ -269,12 +269,30 @@ struct FocusSnapshotResolver {
                 // NSRange read first (native hosts), then the marker-range fallback for
                 // Chromium/WebKit/Electron hosts (Obsidian) that only answer the marker API. Both
                 // run inside this cache closure, so the extra cross-process read happens once per
-                // field identity, never per keystroke.
-                AXHelper.resolveFieldStyle(
+                // field identity, never per keystroke — which also makes this the one place a
+                // per-field style-resolution outcome can be logged without per-keystroke cost.
+                let nsRangeStyle = AXHelper.resolveFieldStyle(
                     for: resolvedCandidate.element,
                     caretLocation: selection.location,
                     textLength: value.utf16.count
-                ) ?? AXHelper.resolveFieldStyleViaTextMarkers(on: resolvedCandidate.element)
+                )
+                let markerStyle = nsRangeStyle == nil
+                    ? AXHelper.resolveFieldStyleViaTextMarkers(on: resolvedCandidate.element)
+                    : nil
+                let resolved = nsRangeStyle ?? markerStyle
+                CotabbyLogger.focus.debug(
+                    "Resolved field style",
+                    metadata: [
+                        "stage": .string("field-style"),
+                        "bundle": .string(application.bundleIdentifier ?? "unknown"),
+                        "source": .string(
+                            nsRangeStyle != nil ? "nsrange" : (markerStyle != nil ? "marker" : "none")),
+                        "font_name": .string(resolved?.fontName ?? "nil"),
+                        "font_size": .stringConvertible(resolved?.fontPointSize.map(Double.init) ?? -1),
+                        "has_text": .stringConvertible(hasText)
+                    ]
+                )
+                return resolved
             }
         }
         // Recognize an xterm.js integrated terminal (VS Code / Cursor / web terminal) from the
