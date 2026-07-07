@@ -243,6 +243,9 @@ enum AXTreeDumpWriter {
         } else {
             out += "fieldStyle: nil (no AXAttributedStringForRange font exposed)\n"
         }
+        // Marker-based font fallback ground truth (Obsidian-class hosts fail the NSRange read above
+        // but expose the style through their marker API).
+        out += AXHelper.markerFieldStyleProbeDescription(on: element) + "\n"
         return out
     }
 

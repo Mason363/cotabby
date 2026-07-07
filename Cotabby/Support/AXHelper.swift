@@ -314,6 +314,74 @@ enum AXHelper {
         return style.isEmpty ? nil : style
     }
 
+    /// Marker-based counterpart of `resolveFieldStyle` for hosts (Chromium/WebKit/Electron) that
+    /// answer the NSRange `AXAttributedStringForRange` with nothing. Obsidian is the motivating
+    /// case: its caret geometry resolves exactly through text markers while the NSRange font read
+    /// fails, leaving the ghost in the system font at a derived size. The same marker plumbing that
+    /// produces the caret also exposes `AXAttributedStringForTextMarkerRange`, which carries the
+    /// AX font dictionary this reads.
+    ///
+    /// Strategy: try the selected marker range first (non-collapsed selections style directly, and
+    /// some engines answer a collapsed caret range with the adjacent run's style anyway); when that
+    /// yields nothing, widen to document-start → selection-start and style the character just
+    /// before the caret. Any miss returns nil so callers keep their default styling.
+    ///
+    /// Same cost contract as `resolveFieldStyle`: a synchronous cross-process AX read intended to
+    /// run once per focused-element identity behind `FieldStyleCache`, never per keystroke. The
+    /// prefix read spans the text before the caret, which is the same order of work as the marker
+    /// selection synthesis the focus poll already performs on these hosts.
+    static func resolveFieldStyleViaTextMarkers(on element: AXUIElement) -> ResolvedFieldStyle? {
+        guard let selectionRange = copyOpaqueAttribute(selectedTextMarkerRangeAttribute, on: element) else {
+            return nil
+        }
+        if let style = fieldStyle(fromMarkerRange: selectionRange, on: element, styling: .firstCharacter) {
+            return style
+        }
+        guard let documentStart = copyOpaqueAttribute(startTextMarkerAttribute, on: element),
+              let selectionStart = copyOpaqueParameterized(
+                startMarkerForRangeAttribute, parameter: selectionRange, on: element),
+              let prefixRange = markerRange(from: documentStart, to: selectionStart, on: element)
+        else {
+            return nil
+        }
+        return fieldStyle(fromMarkerRange: prefixRange, on: element, styling: .lastCharacter)
+    }
+
+    /// One-line ground-truth report of the marker font path for the AX dump probe: whether the
+    /// attribute answers, how long the attributed prefix is, and the style the resolver would use.
+    static func markerFieldStyleProbeDescription(on element: AXUIElement) -> String {
+        guard let style = resolveFieldStyleViaTextMarkers(on: element) else {
+            return "markerFieldStyle: nil (no usable AXAttributedStringForTextMarkerRange)"
+        }
+        let size = style.fontPointSize.map { String(format: "%.1f", $0) } ?? "nil"
+        return "markerFieldStyle: font=\(style.fontName ?? "nil") size=\(size) color=\(style.colorHex ?? "nil")"
+    }
+
+    /// Which character of a marker-range attributed string carries the caret-adjacent style.
+    private enum MarkerStyleAnchor {
+        /// The range starts at the caret (selected range): style the first character.
+        case firstCharacter
+        /// The range ends at the caret (document prefix): style the character just before it.
+        case lastCharacter
+    }
+
+    private static let attributedStringForMarkerRangeAttribute =
+        "AXAttributedStringForTextMarkerRange" as CFString
+
+    private static func fieldStyle(
+        fromMarkerRange range: CFTypeRef,
+        on element: AXUIElement,
+        styling anchor: MarkerStyleAnchor
+    ) -> ResolvedFieldStyle? {
+        guard let attributed = copyOpaqueParameterized(
+            attributedStringForMarkerRangeAttribute, parameter: range, on: element
+        ) as? NSAttributedString, attributed.length > 0 else {
+            return nil
+        }
+        let index = anchor == .firstCharacter ? 0 : attributed.length - 1
+        return fieldStyle(from: attributed.attributes(at: index, effectiveRange: nil))
+    }
+
     /// Some applications (like Chromium and WebKit browsers) do not properly support `AXBoundsForRange`
     /// using `NSRange`. Instead, they use a private, undocumented Accessibility object called `AXTextMarker`.
     ///

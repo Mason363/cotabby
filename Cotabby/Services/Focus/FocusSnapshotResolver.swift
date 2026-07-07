@@ -266,11 +266,15 @@ struct FocusSnapshotResolver {
             let hasText = !value.isEmpty
             let styleKey = "\(application.processIdentifier):\(resolvedCandidate.elementIdentifier):\(hasText)"
             resolvedFieldStyle = fieldStyleCache.style(forKey: styleKey) {
+                // NSRange read first (native hosts), then the marker-range fallback for
+                // Chromium/WebKit/Electron hosts (Obsidian) that only answer the marker API. Both
+                // run inside this cache closure, so the extra cross-process read happens once per
+                // field identity, never per keystroke.
                 AXHelper.resolveFieldStyle(
                     for: resolvedCandidate.element,
                     caretLocation: selection.location,
                     textLength: value.utf16.count
-                )
+                ) ?? AXHelper.resolveFieldStyleViaTextMarkers(on: resolvedCandidate.element)
             }
         }
         // Recognize an xterm.js integrated terminal (VS Code / Cursor / web terminal) from the
