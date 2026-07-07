@@ -115,6 +115,60 @@ struct WindowScreenshotService: WindowScreenshotCapturing {
         return CapturedWindowScreenshot(image: image, windowTitle: matchingWindow.title)
     }
 
+    /// Captures a small band of the focused process's window, given in AppKit/Cocoa screen
+    /// coordinates. Used by the placement pixel probe to read the host's rendered text around the
+    /// caret line. The `desktopIndependentWindow` filter captures ONLY the host window's own
+    /// content, so Cotabby's overlay panels are structurally excluded from the image even while
+    /// the ghost is on screen — the probe always sees clean host pixels.
+    /// Returns the image, the backing scale it was rendered at, and the band actually captured in
+    /// Cocoa coordinates (the request is clamped to the window, so the caller must map pixel rows
+    /// against this rect, not the requested one).
+    func captureBand(
+        cocoaRect: CGRect,
+        processIdentifier: pid_t
+    ) async throws -> (image: CGImage, scale: CGFloat, capturedCocoaRect: CGRect) {
+        guard CGPreflightScreenCaptureAccess() else {
+            throw WindowScreenshotError.screenRecordingPermissionMissing
+        }
+
+        let shareableContent = try await currentShareableContent()
+        let matchingWindow =
+            shareableContent.windows.first(where: {
+                $0.owningApplication?.processID == processIdentifier && $0.isActive && $0.isOnScreen
+            })
+            ?? shareableContent.windows.first(where: {
+                $0.owningApplication?.processID == processIdentifier && $0.isOnScreen
+            })
+        guard let matchingWindow else {
+            throw WindowScreenshotError.noVisibleWindowForProcess(processIdentifier)
+        }
+
+        let sourceRect = convertBetweenAppKitAndCG(rect: cocoaRect)
+            .intersection(matchingWindow.frame)
+            .integral
+        guard !sourceRect.isEmpty else {
+            throw WindowScreenshotError.captureFailed("Probe band lies outside the host window.")
+        }
+        let outputScale = backingScaleFactor(for: sourceRect)
+
+        let filter = SCContentFilter(desktopIndependentWindow: matchingWindow)
+        let configuration = SCStreamConfiguration()
+        configuration.sourceRect = CGRect(
+            x: sourceRect.minX - matchingWindow.frame.minX,
+            y: sourceRect.minY - matchingWindow.frame.minY,
+            width: sourceRect.width,
+            height: sourceRect.height
+        )
+        configuration.width = max(Int((sourceRect.width * outputScale).rounded(.up)), 1)
+        configuration.height = max(Int((sourceRect.height * outputScale).rounded(.up)), 1)
+        configuration.showsCursor = false
+
+        let image = try await captureImage(filter: filter, configuration: configuration)
+        // The Cocoa↔CG flip is an involution, so converting the clamped CG rect back yields the
+        // band's true Cocoa frame for row→screen mapping.
+        return (image, outputScale, convertBetweenAppKitAndCG(rect: sourceRect))
+    }
+
     private func snapshotRect(
         around context: FocusedInputSnapshot,
         windowFrame: CGRect,

@@ -50,6 +50,10 @@ final class SuggestionCoordinator: ObservableObject {
     let userDefaults: UserDefaults
     let overlayPresenter: SuggestionOverlayPresenter
     let logger: SuggestionDebugLogger
+    /// Debug-build self-measurement: screenshots the host window's caret band on present and logs
+    /// the measured host-glyph-vs-caret offset (`stage=placement-probe`). Constructed here rather
+    /// than injected — it is diagnostics-only and needs no test seam.
+    let placementPixelProbe = GhostPlacementProbeService()
     /// Drives the typo gate before each prediction. Owned at app scope (constructed once in
     /// `CotabbyAppEnvironment`) so the underlying `NSSpellChecker` document tag persists across the
     /// coordinator's lifetime instead of churning per keystroke.

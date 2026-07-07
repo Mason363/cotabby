@@ -819,6 +819,11 @@ extension SuggestionCoordinator {
         ) {
             latestOverlayMessage = message
         }
+        placementPixelProbe.probeIfNeeded(
+            geometry: geometry,
+            processIdentifier: context.processIdentifier,
+            bundleIdentifier: context.bundleIdentifier
+        )
     }
 
     /// Repairs untrustworthy caret anchors with a hidden-text-layout estimate before presentation.
