@@ -191,24 +191,27 @@ struct GhostSuggestionLayout: Equatable {
     func panelFrame(for contentSize: CGSize, caretRect: CGRect) -> CGRect {
         let originX = isRightToLeft ? panelOriginX - contentSize.width : panelOriginX
 
-        let originY: CGFloat
-        if lines.count == 1 {
-            // Anchor the GLYPHS, not the panel box, to the caret line. Two upward biases made the
-            // ghost sit "a little too high" everywhere (the recurring field report):
-            //   • the old midpoint formula raised the panel by (caretHeight − contentHeight)/4
-            //     whenever the host line box was taller than the ghost row — i.e. in every editor
-            //     with generous line spacing;
-            //   • the row itself centers its glyphs, so they float (lineHeight − glyphBoxHeight)/2
-            //     above the row bottom.
-            // Compensating both places the ghost's glyph-box bottom on the caret rect's bottom —
-            // the line the host's own glyphs sit on.
-            originY = caretRect.minY - max(0, (lineHeight - glyphBoxHeight) / 2)
-        } else {
-            // Multi-line stacks from the caret's line downward using the layout's line height; the
-            // wrapped tail must keep flowing below, so the top-anchored math is retained here.
-            let topLineCenterY = caretRect.midY + topLineCenterOffsetFromCaret
-            originY = topLineCenterY - contentSize.height + (lineHeight / 2)
-        }
+        // Anchor the FIRST row's GLYPHS, not the panel box, to the caret line — one formula for
+        // single- and multi-line. Two upward biases made the ghost sit "a little too high" (the
+        // recurring field report):
+        //   • the old midpoint formula raised the panel by (caretHeight − contentHeight)/4
+        //     whenever the host line box was taller than the ghost row — i.e. in every editor
+        //     with generous line spacing;
+        //   • the row itself centers its glyphs, so they float (lineHeight − glyphBoxHeight)/2
+        //     above the row bottom.
+        // Multi-line adds a third, measured bias: the old branch assumed rows are `lineHeight`
+        // tall, but the SwiftUI rows render at their natural text height — the placement telemetry
+        // shows contentHeight 2-4pt short of lines.count × lineHeight — which pushed the first
+        // wrapped row ~4pt above its own single-line placement (Antinote 2-line case,
+        // 2026-07-07 overlay-present records). Deriving the row pitch from the ACTUAL content
+        // size (rows are equal-height by construction: same font, lineLimit 1, spacing 0) keeps
+        // the first row exactly where the single-line render would put it, and the wrapped tail
+        // flows below. `topLineCenterOffsetFromCaret` still drops the whole block one line when
+        // the first-line budget was too small to start at the caret.
+        let rowHeight = contentSize.height / CGFloat(max(lines.count, 1))
+        let glyphDrop = max(0, (lineHeight - glyphBoxHeight) / 2)
+        let originY = caretRect.minY + topLineCenterOffsetFromCaret - glyphDrop
+            - (contentSize.height - rowHeight)
 
         return CGRect(
             origin: CGPoint(x: originX, y: originY),

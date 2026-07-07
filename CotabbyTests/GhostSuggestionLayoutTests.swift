@@ -203,6 +203,66 @@ final class GhostSuggestionLayoutTests: XCTestCase {
         XCTAssertLessThanOrEqual(frame.origin.y, caretRect.minY)
     }
 
+    func test_panelFrame_multiLineAnchorsFirstRowExactlyLikeSingleLine() {
+        let caretRect = CGRect(x: 50, y: 100, width: 2, height: 18)
+        let geometry = CotabbyTestFixtures.overlayGeometry(
+            caretRect: caretRect,
+            inputFrameRect: CGRect(x: 0, y: 90, width: 300, height: 30),
+            observedCharWidth: 7
+        )
+
+        let layout = GhostSuggestionLayout.make(
+            text: " a long suggestion that certainly wraps beyond the first line budget here",
+            geometry: geometry,
+            fontSize: 14,
+            visibleFrame: CGRect(x: 0, y: 0, width: 500, height: 300)
+        )
+        XCTAssertGreaterThan(layout.lines.count, 1, "fixture must produce a wrapped layout")
+        guard layout.topLineCenterOffsetFromCaret == 0 else {
+            return XCTFail("fixture should start at the caret line, not below it")
+        }
+
+        // Rows render at their NATURAL text height (measured 2-4pt short of lineHeight per row in
+        // the placement telemetry), so the pitch must come from the actual content size. The first
+        // row's bottom edge must land where a single-line render would put its row bottom — same
+        // glyph anchoring, tail flowing below.
+        let contentSize = CGSize(width: 280, height: 34)
+        let frame = layout.panelFrame(for: contentSize, caretRect: caretRect)
+
+        let rowHeight = contentSize.height / CGFloat(layout.lines.count)
+        let glyphDrop = max(0, (layout.lineHeight - layout.glyphBoxHeight) / 2)
+        let singleLineOriginY = caretRect.minY - glyphDrop
+        XCTAssertEqual(frame.origin.y + contentSize.height - rowHeight, singleLineOriginY, accuracy: 0.001)
+    }
+
+    func test_panelFrame_multiLineStartingBelowCaretDropsOneLine() {
+        // A caret close to the field's right edge leaves no first-line budget, so the block starts
+        // one line below the caret (topLineCenterOffsetFromCaret == -lineHeight). The whole anchor
+        // formula must shift down by exactly that offset — no other term may change.
+        let caretRect = CGRect(x: 292, y: 100, width: 2, height: 18)
+        let geometry = CotabbyTestFixtures.overlayGeometry(
+            caretRect: caretRect,
+            inputFrameRect: CGRect(x: 0, y: 90, width: 300, height: 30),
+            observedCharWidth: 7
+        )
+
+        let layout = GhostSuggestionLayout.make(
+            text: " wrapped continuation text that cannot start at the caret",
+            geometry: geometry,
+            fontSize: 14,
+            visibleFrame: CGRect(x: 0, y: 0, width: 500, height: 300)
+        )
+        XCTAssertEqual(layout.topLineCenterOffsetFromCaret, -layout.lineHeight)
+
+        let contentSize = CGSize(width: 280, height: 34)
+        let frame = layout.panelFrame(for: contentSize, caretRect: caretRect)
+
+        let rowHeight = contentSize.height / CGFloat(layout.lines.count)
+        let glyphDrop = max(0, (layout.lineHeight - layout.glyphBoxHeight) / 2)
+        let expectedY = caretRect.minY - layout.lineHeight - glyphDrop - (contentSize.height - rowHeight)
+        XCTAssertEqual(frame.origin.y, expectedY, accuracy: 0.001)
+    }
+
     // MARK: - Fallback to visible frame
 
     func test_make_usesVisibleFrameFallbackWhenNoInputFrame() {
