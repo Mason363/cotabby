@@ -263,7 +263,7 @@ struct FocusSnapshotResolver {
             // real font (Antinote exposes Menlo-14, yet the ghost stayed in the system font, over-sized
             // and too high). Flipping the key when the first character arrives forces exactly one
             // re-resolution that finds the font; further typing keeps the key stable.
-            let hasText = value.utf16.count > 0
+            let hasText = !value.isEmpty
             let styleKey = "\(application.processIdentifier):\(resolvedCandidate.elementIdentifier):\(hasText)"
             resolvedFieldStyle = fieldStyleCache.style(forKey: styleKey) {
                 AXHelper.resolveFieldStyle(
